@@ -1,0 +1,17 @@
+{
+  "name": "plurality-contracts",
+  "version": "1.0.0",
+  "description": "Plurality Memory NFT smart contracts",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:sapphire-testnet": "hardhat run scripts/deploy.ts --network oasisSapphireTestnet",
+    "deploy:sepolia": "hardhat run scripts/deploy.ts --network sepolia"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/contracts": "^5.1.0",
+    "dotenv": "^16.4.5",
+    "hardhat": "^2.22.0"
+  }
+}
