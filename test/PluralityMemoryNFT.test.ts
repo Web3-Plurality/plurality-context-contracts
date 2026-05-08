@@ -72,12 +72,23 @@ describe("PluralityMemoryNFT", function () {
       ).to.be.revertedWith("Insufficient mint fee");
     });
 
-    it("should revert if profile already minted", async function () {
+    it("should allow multiple mints of the same profile (snapshot model)", async function () {
       await nft.connect(user1).mintBucket(PROFILE_ID, METADATA_URI, { value: MINT_FEE });
+      await nft.connect(user1).mintBucket(PROFILE_ID, "https://other", { value: MINT_FEE });
 
-      await expect(
-        nft.connect(user2).mintBucket(PROFILE_ID, "https://other", { value: MINT_FEE })
-      ).to.be.revertedWith("Profile already minted");
+      // Both tokens exist
+      expect(await nft.balanceOf(user1.address, 1)).to.equal(1);
+      expect(await nft.balanceOf(user1.address, 2)).to.equal(1);
+
+      // getProfileTokens returns both token IDs
+      const tokens = await nft.getProfileTokens(PROFILE_ID);
+      expect(tokens.length).to.equal(2);
+      expect(tokens[0]).to.equal(1);
+      expect(tokens[1]).to.equal(2);
+
+      // getTokensByOwner returns both
+      const owned = await nft.getTokensByOwner(user1.address);
+      expect(owned.length).to.equal(2);
     });
 
     it("should revert with empty metadata URI", async function () {
@@ -298,6 +309,43 @@ describe("PluralityMemoryNFT", function () {
 
     it("should revert if non-holder tries to update", async function () {
       await expect(nft.connect(user2).updateMetadata(1, "hacker")).to.be.revertedWith("Not token holder");
+    });
+  });
+
+  describe("Multi-mint & Ownership Tracking", function () {
+    it("should track tokens per owner across mints", async function () {
+      await nft.connect(user1).mintBucket(PROFILE_ID, METADATA_URI, { value: MINT_FEE });
+      await nft.connect(user1).mintBucket(PROFILE_ID_2, "https://other", { value: MINT_FEE });
+
+      const owned = await nft.getTokensByOwner(user1.address);
+      expect(owned.length).to.equal(2);
+      expect(owned[0]).to.equal(1);
+      expect(owned[1]).to.equal(2);
+    });
+
+    it("should update _ownedTokens on transfer (marketplace buy)", async function () {
+      await nft.connect(user1).mintBucket(PROFILE_ID, METADATA_URI, { value: MINT_FEE });
+      await nft.connect(user1).setApprovalForAll(await nft.getAddress(), true);
+      await nft.connect(user1).listBucket(1, ethers.parseEther("1"));
+      await nft.connect(user2).buyBucket(1, { value: ethers.parseEther("1") });
+
+      // user1 should have no tokens, user2 should have token 1
+      const ownedByUser1 = await nft.getTokensByOwner(user1.address);
+      expect(ownedByUser1.length).to.equal(0);
+
+      const ownedByUser2 = await nft.getTokensByOwner(user2.address);
+      expect(ownedByUser2.length).to.equal(1);
+      expect(ownedByUser2[0]).to.equal(1);
+    });
+
+    it("should return empty array for getProfileTokens with unknown profileId", async function () {
+      const tokens = await nft.getProfileTokens(PROFILE_ID);
+      expect(tokens.length).to.equal(0);
+    });
+
+    it("should return empty array for getTokensByOwner with no tokens", async function () {
+      const owned = await nft.getTokensByOwner(user2.address);
+      expect(owned.length).to.equal(0);
     });
   });
 

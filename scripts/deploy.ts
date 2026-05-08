@@ -29,11 +29,18 @@ async function main() {
   const registryAddress = await registry.getAddress();
   console.log("ContextRegistry deployed to:", registryAddress);
 
-  // 3. Grant REGISTRAR_ROLE to deployer (backend hot wallet)
-  // If your backend uses a different wallet, grant the role to that address:
-  // const backendWallet = "0x...";
-  // await registry.grantRole(await registry.REGISTRAR_ROLE(), backendWallet);
-  console.log("\nRegistrar role already granted to deployer (default)");
+  // 3. Grant REGISTRAR_ROLE to deployer + (optionally) a separate backend wallet.
+  //    Set BACKEND_WALLET_ADDRESS in .env when the backend signer is different
+  //    from the deployer; otherwise the deployer alone can register contexts.
+  const backendWallet = process.env.BACKEND_WALLET_ADDRESS?.trim();
+  if (backendWallet && backendWallet.toLowerCase() !== deployer.address.toLowerCase()) {
+    console.log(`\nGranting REGISTRAR_ROLE to backend wallet: ${backendWallet}`);
+    const tx = await registry.grantRole(await registry.REGISTRAR_ROLE(), backendWallet);
+    await tx.wait();
+    console.log("REGISTRAR_ROLE granted.");
+  } else {
+    console.log("\nREGISTRAR_ROLE held by deployer (no separate backend wallet configured)");
+  }
 
   // 4. Export deployment info
   const deployment = {
@@ -60,12 +67,16 @@ async function main() {
   fs.writeFileSync(outputPath, JSON.stringify(deployment, null, 2));
   console.log("\nDeployment info saved to:", outputPath);
 
-  // 5. Copy ABIs to backend and frontend
+  // 5. Copy ABIs to every consumer that vendors them. We have three:
+  //    backend, marketplace frontend, and memory-studio frontend.
   const artifactsDir = path.join(__dirname, "..", "artifacts", "contracts");
-  const backendAbiDir = path.join(__dirname, "..", "..", "plurality-backend-api", "src", "services", "blockchain-service", "abis");
-  const frontendAbiDir = path.join(__dirname, "..", "..", "plurality-memory-studio", "src", "abis");
+  const abiTargets = [
+    path.join(__dirname, "..", "..", "plurality-backend-api", "src", "services", "blockchain-service", "abis"),
+    path.join(__dirname, "..", "..", "plurality-market-place", "src", "abis"),
+    path.join(__dirname, "..", "..", "plurality-memory-studio", "src", "abis"),
+  ];
 
-  for (const dir of [backendAbiDir, frontendAbiDir]) {
+  for (const dir of abiTargets) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
@@ -78,9 +89,10 @@ async function main() {
       const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf-8"));
       const abiJson = JSON.stringify(artifact.abi, null, 2);
 
-      fs.writeFileSync(path.join(backendAbiDir, `${name}.json`), abiJson);
-      fs.writeFileSync(path.join(frontendAbiDir, `${name}.json`), abiJson);
-      console.log(`ABI for ${name} copied to backend and frontend`);
+      for (const dir of abiTargets) {
+        fs.writeFileSync(path.join(dir, `${name}.json`), abiJson);
+      }
+      console.log(`ABI for ${name} copied to ${abiTargets.length} consumer(s)`);
     }
   }
 

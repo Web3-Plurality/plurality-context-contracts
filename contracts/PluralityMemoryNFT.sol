@@ -41,11 +41,14 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     // tokenId => off-chain profileId (UUID as bytes16)
     mapping(uint256 => bytes16) public tokenToProfileId;
 
-    // profileId hash => tokenId (prevent double-minting)
-    mapping(bytes32 => uint256) public profileIdToToken;
+    // profileId hash => tokenIds (supports multiple mints per profile)
+    mapping(bytes32 => uint256[]) public profileTokens;
 
     // On-chain access control: tokenId => address => role (0=none, 1=viewer, 2=editor)
     mapping(uint256 => mapping(address => uint8)) public bucketAccess;
+
+    // Track tokens per owner for enumeration
+    mapping(address => uint256[]) private _ownedTokens;
 
     // ──── Marketplace ────
     struct Listing {
@@ -147,7 +150,6 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         require(bytes(metadataURI).length > 0, "Empty metadata URI");
 
         bytes32 profileHash = keccak256(abi.encodePacked(profileId));
-        require(profileIdToToken[profileHash] == 0, "Profile already minted");
 
         uint256 tokenId = ++_nextTokenId;
 
@@ -156,7 +158,7 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         tokenCreator[tokenId] = msg.sender;
         _tokenURIs[tokenId] = metadataURI;
         tokenToProfileId[tokenId] = profileId;
-        profileIdToToken[profileHash] = tokenId;
+        profileTokens[profileHash].push(tokenId);
 
         // ERC-2981: royalty on this token goes to PLATFORM (not creator)
         _setTokenRoyalty(tokenId, feeRecipient, royaltyBps);
@@ -297,6 +299,61 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
 
     function uri(uint256 tokenId) public view override returns (string memory) {
         return _tokenURIs[tokenId];
+    }
+
+    // ══════════════════════════════════════════════
+    //              MULTI-MINT VIEWS
+    // ══════════════════════════════════════════════
+
+    /// @notice Get all token IDs minted for a given profileId
+    function getProfileTokens(bytes16 profileId) external view returns (uint256[] memory) {
+        bytes32 profileHash = keccak256(abi.encodePacked(profileId));
+        return profileTokens[profileHash];
+    }
+
+    /// @notice Get all token IDs owned by an address
+    function getTokensByOwner(address owner) external view returns (uint256[] memory) {
+        return _ownedTokens[owner];
+    }
+
+    // ══════════════════════════════════════════════
+    //            ERC1155 OVERRIDE
+    // ══════════════════════════════════════════════
+
+    /// @dev Override _update to maintain _ownedTokens index on every transfer/mint/burn.
+    function _update(
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory values
+    ) internal override {
+        super._update(from, to, ids, values);
+
+        for (uint256 i = 0; i < ids.length; i++) {
+            uint256 tokenId = ids[i];
+
+            // Remove from sender (not applicable on mint where from == address(0))
+            if (from != address(0)) {
+                _removeTokenFromOwner(from, tokenId);
+            }
+
+            // Add to receiver (not applicable on burn where to == address(0))
+            if (to != address(0)) {
+                _ownedTokens[to].push(tokenId);
+            }
+        }
+    }
+
+    /// @dev Remove a tokenId from the owner's _ownedTokens array (swap-and-pop).
+    function _removeTokenFromOwner(address owner, uint256 tokenId) private {
+        uint256[] storage tokens = _ownedTokens[owner];
+        for (uint256 i = 0; i < tokens.length; i++) {
+            if (tokens[i] == tokenId) {
+                tokens[i] = tokens[tokens.length - 1];
+                tokens.pop();
+                return;
+            }
+        }
     }
 
     // ══════════════════════════════════════════════

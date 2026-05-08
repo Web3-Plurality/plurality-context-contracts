@@ -35,7 +35,9 @@ export interface PluralityMemoryNFTInterface extends Interface {
       | "delistBucket"
       | "feeRecipient"
       | "getListing"
+      | "getProfileTokens"
       | "getRoleAdmin"
+      | "getTokensByOwner"
       | "grantAccess"
       | "grantRole"
       | "hasAccess"
@@ -49,7 +51,7 @@ export interface PluralityMemoryNFTInterface extends Interface {
       | "nextTokenId"
       | "pause"
       | "paused"
-      | "profileIdToToken"
+      | "profileTokens"
       | "renounceRole"
       | "revokeAccess"
       | "revokeRole"
@@ -130,8 +132,16 @@ export interface PluralityMemoryNFTInterface extends Interface {
     values: [BigNumberish]
   ): string;
   encodeFunctionData(
+    functionFragment: "getProfileTokens",
+    values: [BytesLike]
+  ): string;
+  encodeFunctionData(
     functionFragment: "getRoleAdmin",
     values: [BytesLike]
+  ): string;
+  encodeFunctionData(
+    functionFragment: "getTokensByOwner",
+    values: [AddressLike]
   ): string;
   encodeFunctionData(
     functionFragment: "grantAccess",
@@ -177,8 +187,8 @@ export interface PluralityMemoryNFTInterface extends Interface {
   encodeFunctionData(functionFragment: "pause", values?: undefined): string;
   encodeFunctionData(functionFragment: "paused", values?: undefined): string;
   encodeFunctionData(
-    functionFragment: "profileIdToToken",
-    values: [BytesLike]
+    functionFragment: "profileTokens",
+    values: [BytesLike, BigNumberish]
   ): string;
   encodeFunctionData(
     functionFragment: "renounceRole",
@@ -281,7 +291,15 @@ export interface PluralityMemoryNFTInterface extends Interface {
   ): Result;
   decodeFunctionResult(functionFragment: "getListing", data: BytesLike): Result;
   decodeFunctionResult(
+    functionFragment: "getProfileTokens",
+    data: BytesLike
+  ): Result;
+  decodeFunctionResult(
     functionFragment: "getRoleAdmin",
+    data: BytesLike
+  ): Result;
+  decodeFunctionResult(
+    functionFragment: "getTokensByOwner",
     data: BytesLike
   ): Result;
   decodeFunctionResult(
@@ -310,7 +328,7 @@ export interface PluralityMemoryNFTInterface extends Interface {
   decodeFunctionResult(functionFragment: "pause", data: BytesLike): Result;
   decodeFunctionResult(functionFragment: "paused", data: BytesLike): Result;
   decodeFunctionResult(
-    functionFragment: "profileIdToToken",
+    functionFragment: "profileTokens",
     data: BytesLike
   ): Result;
   decodeFunctionResult(
@@ -855,7 +873,19 @@ export interface PluralityMemoryNFT extends BaseContract {
     "view"
   >;
 
+  getProfileTokens: TypedContractMethod<
+    [profileId: BytesLike],
+    [bigint[]],
+    "view"
+  >;
+
   getRoleAdmin: TypedContractMethod<[role: BytesLike], [string], "view">;
+
+  getTokensByOwner: TypedContractMethod<
+    [owner: AddressLike],
+    [bigint[]],
+    "view"
+  >;
 
   grantAccess: TypedContractMethod<
     [tokenId: BigNumberish, to: AddressLike, role: BigNumberish],
@@ -921,7 +951,11 @@ export interface PluralityMemoryNFT extends BaseContract {
 
   paused: TypedContractMethod<[], [boolean], "view">;
 
-  profileIdToToken: TypedContractMethod<[arg0: BytesLike], [bigint], "view">;
+  profileTokens: TypedContractMethod<
+    [arg0: BytesLike, arg1: BigNumberish],
+    [bigint],
+    "view"
+  >;
 
   renounceRole: TypedContractMethod<
     [role: BytesLike, callerConfirmation: AddressLike],
@@ -1077,8 +1111,14 @@ export interface PluralityMemoryNFT extends BaseContract {
     "view"
   >;
   getFunction(
+    nameOrSignature: "getProfileTokens"
+  ): TypedContractMethod<[profileId: BytesLike], [bigint[]], "view">;
+  getFunction(
     nameOrSignature: "getRoleAdmin"
   ): TypedContractMethod<[role: BytesLike], [string], "view">;
+  getFunction(
+    nameOrSignature: "getTokensByOwner"
+  ): TypedContractMethod<[owner: AddressLike], [bigint[]], "view">;
   getFunction(
     nameOrSignature: "grantAccess"
   ): TypedContractMethod<
@@ -1157,8 +1197,12 @@ export interface PluralityMemoryNFT extends BaseContract {
     nameOrSignature: "paused"
   ): TypedContractMethod<[], [boolean], "view">;
   getFunction(
-    nameOrSignature: "profileIdToToken"
-  ): TypedContractMethod<[arg0: BytesLike], [bigint], "view">;
+    nameOrSignature: "profileTokens"
+  ): TypedContractMethod<
+    [arg0: BytesLike, arg1: BigNumberish],
+    [bigint],
+    "view"
+  >;
   getFunction(
     nameOrSignature: "renounceRole"
   ): TypedContractMethod<
