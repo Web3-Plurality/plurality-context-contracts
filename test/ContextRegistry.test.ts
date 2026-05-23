@@ -1,189 +1,235 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import { ContextRegistry, PluralityMemoryNFT } from "../typechain-types";
+import { ContextRegistry } from "../typechain-types";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
-describe("ContextRegistry", function () {
-  let nft: PluralityMemoryNFT;
+describe("ContextRegistry — append-only, batch-only, registrant-claim", function () {
   let registry: ContextRegistry;
-  let owner: SignerWithAddress;
-  let user1: SignerWithAddress;
-  let user2: SignerWithAddress;
+  let admin: SignerWithAddress;
+  let alice: SignerWithAddress;       // bucket creator
+  let bob: SignerWithAddress;         // unrelated wallet
 
-  const MINT_FEE = ethers.parseEther("0.01");
-  const PROFILE_ID = "0x550e8400e29b41d4a716446655440000" as `0x${string}`;
-  const CONTEXT_ID = "0x660e8400e29b41d4a716446655440001" as `0x${string}`;
-  const CONTEXT_ID_2 = "0x770e8400e29b41d4a716446655440002" as `0x${string}`;
-  const CONTENT_HASH = ethers.keccak256(ethers.toUtf8Bytes("Hello, this is my document content"));
-  const CONTENT_HASH_2 = ethers.keccak256(ethers.toUtf8Bytes("Another document"));
-  const METADATA_URI = "ipfs://QmContextMetadata123";
-  const BUCKET_METADATA = "ipfs://QmBucketMetadata";
+  const BUCKET_HASH = "0x550e8400e29b41d4a716446655440000550e8400e29b41d4a716446655440000" as `0x${string}`;
+  const BUCKET_HASH_2 = "0x660e8400e29b41d4a716446655440000660e8400e29b41d4a716446655440000" as `0x${string}`;
+
+  const CTX1 = "0x11111111111111111111111111111111" as `0x${string}`;
+  const CTX2 = "0x22222222222222222222222222222222" as `0x${string}`;
+  const CTX3 = "0x33333333333333333333333333333333" as `0x${string}`;
+
+  const HASH1 = ethers.keccak256(ethers.toUtf8Bytes("doc one"));
+  const HASH2 = ethers.keccak256(ethers.toUtf8Bytes("doc two"));
+  const HASH3 = ethers.keccak256(ethers.toUtf8Bytes("doc three"));
+
+  const URI1 = "ipfs://one";
+  const URI2 = "ipfs://two";
+  const URI3 = "ipfs://three";
 
   beforeEach(async function () {
-    [owner, user1, user2] = await ethers.getSigners();
-
-    // Deploy NFT contract first
-    const NFTFactory = await ethers.getContractFactory("PluralityMemoryNFT");
-    nft = await NFTFactory.deploy(owner.address, MINT_FEE, 500, 250);
-    await nft.waitForDeployment();
-
-    // Deploy Registry
-    const RegistryFactory = await ethers.getContractFactory("ContextRegistry");
-    registry = await RegistryFactory.deploy(await nft.getAddress());
+    [admin, alice, bob] = await ethers.getSigners();
+    const Factory = await ethers.getContractFactory("ContextRegistry");
+    registry = await Factory.deploy();
     await registry.waitForDeployment();
-
-    // Mint a bucket for testing
-    await nft.connect(user1).mintBucket(PROFILE_ID, BUCKET_METADATA, { value: MINT_FEE });
   });
 
   describe("Deployment", function () {
-    it("should set correct NFT address", async function () {
-      expect(await registry.memoryNFT()).to.equal(await nft.getAddress());
+    it("grants admin role to deployer", async function () {
+      const adminRole = await registry.DEFAULT_ADMIN_ROLE();
+      expect(await registry.hasRole(adminRole, admin.address)).to.be.true;
     });
 
-    it("should grant admin and registrar roles to deployer", async function () {
-      const adminRole = await registry.DEFAULT_ADMIN_ROLE();
-      const registrarRole = await registry.REGISTRAR_ROLE();
-      expect(await registry.hasRole(adminRole, owner.address)).to.be.true;
-      expect(await registry.hasRole(registrarRole, owner.address)).to.be.true;
+    it("starts with zero registrations", async function () {
+      expect(await registry.totalRegistered()).to.equal(0);
+    });
+
+    it("returns zero address for an unclaimed bucketHash", async function () {
+      expect(await registry.getBucketRegistrant(BUCKET_HASH)).to.equal(ethers.ZeroAddress);
     });
   });
 
-  describe("Context Registration", function () {
-    it("should register a context", async function () {
+  describe("registerContextBatch — happy path", function () {
+    it("registers contexts and claims the bucketHash", async function () {
       await expect(
-        registry.registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI)
+        registry.connect(alice).registerContextBatch(
+          BUCKET_HASH,
+          [CTX1, CTX2],
+          [HASH1, HASH2],
+          [URI1, URI2],
+          ["file", "chat"],
+        ),
       )
-        .to.emit(registry, "ContextRegistered")
-        .withArgs(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI, owner.address, (v: any) => true);
+        .to.emit(registry, "BucketRegistrantClaimed").withArgs(BUCKET_HASH, alice.address, (v: any) => true)
+        .and.to.emit(registry, "ContextRegistered"); // fires twice
 
-      expect(await registry.totalRegistered()).to.equal(1);
+      expect(await registry.totalRegistered()).to.equal(2);
+      expect(await registry.getBucketRegistrant(BUCKET_HASH)).to.equal(alice.address);
+      expect(await registry.getBucketContextCount(BUCKET_HASH)).to.equal(2);
     });
 
-    it("should store correct context data", async function () {
-      await registry.registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI);
+    it("stores the correct entry fields", async function () {
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], ["file"]);
 
-      const entry = await registry.getContext(CONTEXT_ID);
-      expect(entry.contentHash).to.equal(CONTENT_HASH);
-      expect(entry.metadataURI).to.equal(METADATA_URI);
-      expect(entry.registeredBy).to.equal(owner.address);
-      expect(entry.bucketTokenId).to.equal(1);
+      const entry = await registry.getContext(CTX1);
+      expect(entry.contentHash).to.equal(HASH1);
+      expect(entry.bucketHash).to.equal(BUCKET_HASH);
+      expect(entry.registeredBy).to.equal(alice.address);
+      expect(entry.metadataURI).to.equal(URI1);
       expect(entry.sourceType).to.equal("file");
-      expect(entry.revoked).to.be.false;
+      expect(entry.registeredAt).to.be.greaterThan(0);
     });
 
-    it("should add to bucket contexts", async function () {
-      await registry.registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI);
-      await registry.registerContext(CONTEXT_ID_2, 1, CONTENT_HASH_2, "chat", "ipfs://other");
+    it("populates the bucketHash → contextIds list", async function () {
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX1, CTX2], [HASH1, HASH2], [URI1, URI2], ["file", "chat"]);
 
-      const ids = await registry.getBucketContextIds(1);
-      expect(ids.length).to.equal(2);
-      expect(await registry.getBucketContextCount(1)).to.equal(2);
+      const ids = await registry.getContextsByBucketHash(BUCKET_HASH);
+      expect(ids).to.deep.equal([CTX1, CTX2]);
     });
 
-    it("should revert if context already registered", async function () {
-      await registry.registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI);
+    it("lets the same registrant extend a bucket they already claimed", async function () {
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], ["file"]);
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX2], [HASH2], [URI2], ["chat"]);
+
+      expect(await registry.getBucketContextCount(BUCKET_HASH)).to.equal(2);
+    });
+  });
+
+  describe("registerContextBatch — claim enforcement", function () {
+    it("reverts when a different wallet tries to register under a claimed bucketHash", async function () {
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], ["file"]);
 
       await expect(
-        registry.registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI)
+        registry
+          .connect(bob)
+          .registerContextBatch(BUCKET_HASH, [CTX2], [HASH2], [URI2], ["chat"]),
+      ).to.be.revertedWith("Bucket claimed by another wallet");
+    });
+
+    it("allows different wallets to register under different bucketHashes", async function () {
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], ["file"]);
+      await registry
+        .connect(bob)
+        .registerContextBatch(BUCKET_HASH_2, [CTX2], [HASH2], [URI2], ["chat"]);
+
+      expect(await registry.getBucketRegistrant(BUCKET_HASH)).to.equal(alice.address);
+      expect(await registry.getBucketRegistrant(BUCKET_HASH_2)).to.equal(bob.address);
+    });
+  });
+
+  describe("registerContextBatch — input validation", function () {
+    it("reverts on empty batch", async function () {
+      await expect(
+        registry.connect(alice).registerContextBatch(BUCKET_HASH, [], [], [], []),
+      ).to.be.revertedWith("Empty batch");
+    });
+
+    it("reverts on zero bucketHash", async function () {
+      await expect(
+        registry
+          .connect(alice)
+          .registerContextBatch(ethers.ZeroHash, [CTX1], [HASH1], [URI1], ["file"]),
+      ).to.be.revertedWith("Empty bucket hash");
+    });
+
+    it("reverts on length mismatch", async function () {
+      await expect(
+        registry
+          .connect(alice)
+          .registerContextBatch(BUCKET_HASH, [CTX1, CTX2], [HASH1], [URI1, URI2], ["file", "chat"]),
+      ).to.be.revertedWith("Length mismatch");
+    });
+
+    it("reverts on duplicate contextId across calls (entire tx reverts)", async function () {
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], ["file"]);
+
+      await expect(
+        registry
+          .connect(alice)
+          .registerContextBatch(BUCKET_HASH, [CTX1], [HASH2], [URI2], ["chat"]),
       ).to.be.revertedWith("Context already registered");
     });
 
-    it("should revert if empty content hash", async function () {
+    it("reverts on zero contentHash", async function () {
       await expect(
-        registry.registerContext(CONTEXT_ID, 1, ethers.ZeroHash, "file", METADATA_URI)
+        registry
+          .connect(alice)
+          .registerContextBatch(BUCKET_HASH, [CTX1], [ethers.ZeroHash], [URI1], ["file"]),
       ).to.be.revertedWith("Empty content hash");
     });
 
-    it("should revert if non-registrar tries to register", async function () {
+    it("is atomic — one bad entry reverts the whole batch", async function () {
+      // Pre-register CTX1
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], ["file"]);
+      expect(await registry.totalRegistered()).to.equal(1);
+
+      // Try to register [CTX2 (new), CTX1 (duplicate)] — should revert
+      // entirely; CTX2 must NOT end up registered.
       await expect(
-        registry.connect(user1).registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI)
-      ).to.be.reverted;
+        registry
+          .connect(alice)
+          .registerContextBatch(
+            BUCKET_HASH,
+            [CTX2, CTX1],
+            [HASH2, HASH1],
+            [URI2, URI1],
+            ["chat", "file"],
+          ),
+      ).to.be.revertedWith("Context already registered");
+
+      expect(await registry.totalRegistered()).to.equal(1);
+      const entry = await registry.getContext(CTX2);
+      expect(entry.registeredAt).to.equal(0);
     });
   });
 
-  describe("Verification", function () {
+  describe("Verification + provenance", function () {
     beforeEach(async function () {
-      await registry.registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI);
+      await registry
+        .connect(alice)
+        .registerContextBatch(
+          BUCKET_HASH,
+          [CTX1, CTX2, CTX3],
+          [HASH1, HASH2, HASH3],
+          [URI1, URI2, URI3],
+          ["file", "chat", "text"],
+        );
     });
 
-    it("should verify correct content hash", async function () {
-      expect(await registry.verifyContent(CONTEXT_ID, CONTENT_HASH)).to.be.true;
+    it("verifies registered content", async function () {
+      expect(await registry.verifyContent(CTX1, HASH1)).to.be.true;
     });
 
-    it("should reject incorrect content hash", async function () {
-      const wrongHash = ethers.keccak256(ethers.toUtf8Bytes("tampered content"));
-      expect(await registry.verifyContent(CONTEXT_ID, wrongHash)).to.be.false;
+    it("rejects wrong content for a registered context", async function () {
+      const wrong = ethers.keccak256(ethers.toUtf8Bytes("tampered"));
+      expect(await registry.verifyContent(CTX1, wrong)).to.be.false;
     });
 
-    it("should reject verification of non-existent context", async function () {
-      expect(await registry.verifyContent(CONTEXT_ID_2, CONTENT_HASH)).to.be.false;
-    });
-
-    it("should reject verification of revoked context", async function () {
-      await registry.revokeContext(CONTEXT_ID);
-      expect(await registry.verifyContent(CONTEXT_ID, CONTENT_HASH)).to.be.false;
-    });
-  });
-
-  describe("Provenance Lookup", function () {
-    it("should look up provenance by hash", async function () {
-      await registry.registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI);
-
-      const [contextId, registeredAt, registeredBy, bucketTokenId] =
-        await registry.getProvenanceByHash(CONTENT_HASH);
-
-      expect(contextId).to.equal(CONTEXT_ID);
-      expect(registeredBy).to.equal(owner.address);
-      expect(bucketTokenId).to.equal(1);
+    it("returns provenance for a known content hash", async function () {
+      const [contextId, registeredAt, registeredBy, bucketHash] =
+        await registry.getProvenanceByHash(HASH2);
+      expect(contextId).to.equal(CTX2);
+      expect(registeredBy).to.equal(alice.address);
+      expect(bucketHash).to.equal(BUCKET_HASH);
       expect(registeredAt).to.be.greaterThan(0);
     });
-  });
 
-  describe("Revocation", function () {
-    beforeEach(async function () {
-      await registry.registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI);
-    });
-
-    it("should revoke a context", async function () {
-      await expect(registry.revokeContext(CONTEXT_ID))
-        .to.emit(registry, "ContextRevoked")
-        .withArgs(CONTEXT_ID, 1, owner.address, (v: any) => true);
-
-      const entry = await registry.getContext(CONTEXT_ID);
-      expect(entry.revoked).to.be.true;
-    });
-
-    it("should revert if already revoked", async function () {
-      await registry.revokeContext(CONTEXT_ID);
-      await expect(registry.revokeContext(CONTEXT_ID)).to.be.revertedWith("Already revoked");
-    });
-
-    it("should revert if context not found", async function () {
-      await expect(registry.revokeContext(CONTEXT_ID_2)).to.be.revertedWith("Context not found");
-    });
-  });
-
-  describe("Metadata Update", function () {
-    beforeEach(async function () {
-      await registry.registerContext(CONTEXT_ID, 1, CONTENT_HASH, "file", METADATA_URI);
-    });
-
-    it("should update metadata URI", async function () {
-      const newURI = "ipfs://QmUpdatedMetadata";
-      await expect(registry.updateContextMetadata(CONTEXT_ID, newURI))
-        .to.emit(registry, "ContextMetadataUpdated")
-        .withArgs(CONTEXT_ID, METADATA_URI, newURI, (v: any) => true);
-
-      const entry = await registry.getContext(CONTEXT_ID);
-      expect(entry.metadataURI).to.equal(newURI);
-    });
-
-    it("should revert update on revoked context", async function () {
-      await registry.revokeContext(CONTEXT_ID);
-      await expect(
-        registry.updateContextMetadata(CONTEXT_ID, "ipfs://new")
-      ).to.be.revertedWith("Context revoked");
+    it("returns the full context list for a bucketHash", async function () {
+      const ids = await registry.getContextsByBucketHash(BUCKET_HASH);
+      expect(ids).to.deep.equal([CTX1, CTX2, CTX3]);
     });
   });
 });

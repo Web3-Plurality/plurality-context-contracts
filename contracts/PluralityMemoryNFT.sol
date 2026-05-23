@@ -7,18 +7,32 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+/// Minimal interface the NFT needs from ContextRegistry to enforce
+/// "register-before-mint" on-chain.
+interface IContextRegistry {
+    function getBucketRegistrant(bytes32 bucketHash) external view returns (address);
+    function getBucketContextCount(bytes32 bucketHash) external view returns (uint256);
+}
+
 /**
  * @title PluralityMemoryNFT
  * @notice ERC-1155 NFT contract for minting memory buckets (AI profiles).
  *         Each bucket maps to a unique token ID with supply of 1.
  *
+ *         Register-first model: before minting, the creator must register
+ *         the bucket's contexts in ContextRegistry (one tx). Then they mint
+ *         the NFT (second tx). `mintBucket` requires that `msg.sender` is
+ *         the registrant of the bucketHash — this makes the chain itself
+ *         enforce the link between provenance and ownership.
+ *
+ *         The NFT *is* the access token: holding the NFT for a given
+ *         `bucketHash` is the sole proof of bucket read access. Backends
+ *         resolve permission by reading on-chain ownership.
+ *
  *         Fee system (ALL fees go to the platform):
  *           - Mint fee: paid in ROSE when minting a new bucket
  *           - ERC-2981 royalty: 5% on every secondary sale (reported to marketplaces)
  *           - Marketplace commission: 2.5% on sales through the built-in marketplace
- *
- *         Includes a built-in marketplace for listing/buying bucket NFTs,
- *         on-chain access control mirroring off-chain roles.
  */
 contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, ReentrancyGuard {
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
@@ -32,20 +46,17 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     // Token ID counter
     uint256 private _nextTokenId;
 
+    // ContextRegistry — read at mintBucket() to enforce register-first.
+    IContextRegistry public immutable registry;
+
     // tokenId => creator (original minter)
     mapping(uint256 => address) public tokenCreator;
 
     // tokenId => metadata URI
     mapping(uint256 => string) private _tokenURIs;
 
-    // tokenId => off-chain profileId (UUID as bytes16)
-    mapping(uint256 => bytes16) public tokenToProfileId;
-
-    // profileId hash => tokenIds (supports multiple mints per profile)
-    mapping(bytes32 => uint256[]) public profileTokens;
-
-    // On-chain access control: tokenId => address => role (0=none, 1=viewer, 2=editor)
-    mapping(uint256 => mapping(address => uint8)) public bucketAccess;
+    // tokenId => SHA-256 bucket hash (Merkle of contextHashes, ordered createdAt ASC, contextId ASC)
+    mapping(uint256 => bytes32) public tokenToBucketHash;
 
     // Track tokens per owner for enumeration
     mapping(address => uint256[]) private _ownedTokens;
@@ -62,7 +73,7 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     event BucketMinted(
         uint256 indexed tokenId,
         address indexed creator,
-        bytes16 profileId,
+        bytes32 bucketHash,
         string metadataURI,
         uint256 timestamp
     );
@@ -71,19 +82,6 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         uint256 indexed tokenId,
         string oldURI,
         string newURI,
-        uint256 timestamp
-    );
-
-    event AccessGranted(
-        uint256 indexed tokenId,
-        address indexed grantedTo,
-        uint8 role,
-        uint256 timestamp
-    );
-
-    event AccessRevoked(
-        uint256 indexed tokenId,
-        address indexed revokedFrom,
         uint256 timestamp
     );
 
@@ -116,11 +114,13 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     );
 
     constructor(
+        address _registry,
         address _feeRecipient,
         uint256 _mintFee,
         uint96 _royaltyBps,
         uint96 _marketplaceFeeBps
     ) ERC1155("") {
+        require(_registry != address(0), "Invalid registry");
         require(_feeRecipient != address(0), "Invalid fee recipient");
         require(_royaltyBps <= 10000, "Royalty too high");
         require(_marketplaceFeeBps <= 5000, "Marketplace fee too high"); // max 50%
@@ -128,6 +128,7 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(MINTER_ROLE, msg.sender);
 
+        registry = IContextRegistry(_registry);
         feeRecipient = _feeRecipient;
         mintFee = _mintFee;
         royaltyBps = _royaltyBps;
@@ -141,15 +142,26 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     //                   MINTING
     // ══════════════════════════════════════════════
 
-    /// @notice Mint a new memory bucket NFT. Mint fee goes to platform.
+    /// @notice Mint a memory bucket NFT. The caller must have already registered
+    ///         the bucket's contexts in ContextRegistry — `registry.bucketRegistrant[
+    ///         bucketHash]` must equal `msg.sender`. Mint fee goes to platform.
+    /// @param bucketHash  SHA-256 Merkle of the bucket's context hashes (off-chain).
+    /// @param metadataURI URI pointing to bucket metadata JSON.
     function mintBucket(
-        bytes16 profileId,
+        bytes32 bucketHash,
         string calldata metadataURI
     ) external payable whenNotPaused returns (uint256) {
         require(msg.value >= mintFee, "Insufficient mint fee");
+        require(bucketHash != bytes32(0), "Empty bucket hash");
         require(bytes(metadataURI).length > 0, "Empty metadata URI");
 
-        bytes32 profileHash = keccak256(abi.encodePacked(profileId));
+        // Enforce register-first: the bucketHash must be claimed by the caller
+        // in the registry. This is what makes "the NFT covers exactly the
+        // contexts you registered" a trustless on-chain property.
+        require(
+            registry.getBucketRegistrant(bucketHash) == msg.sender,
+            "Register contexts first"
+        );
 
         uint256 tokenId = ++_nextTokenId;
 
@@ -157,8 +169,7 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
 
         tokenCreator[tokenId] = msg.sender;
         _tokenURIs[tokenId] = metadataURI;
-        tokenToProfileId[tokenId] = profileId;
-        profileTokens[profileHash].push(tokenId);
+        tokenToBucketHash[tokenId] = bucketHash;
 
         // ERC-2981: royalty on this token goes to PLATFORM (not creator)
         _setTokenRoyalty(tokenId, feeRecipient, royaltyBps);
@@ -169,7 +180,7 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
             require(sent, "Fee transfer failed");
         }
 
-        emit BucketMinted(tokenId, msg.sender, profileId, metadataURI, block.timestamp);
+        emit BucketMinted(tokenId, msg.sender, bucketHash, metadataURI, block.timestamp);
         return tokenId;
     }
 
@@ -254,7 +265,7 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     }
 
     // ══════════════════════════════════════════════
-    //              METADATA & ACCESS
+    //                  METADATA
     // ══════════════════════════════════════════════
 
     /// @notice Update metadata URI (only token holder)
@@ -268,31 +279,6 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         emit MetadataUpdated(tokenId, oldURI, newURI, block.timestamp);
     }
 
-    /// @notice Grant on-chain access (mirrors off-chain sharing)
-    function grantAccess(uint256 tokenId, address to, uint8 role) external {
-        require(balanceOf(msg.sender, tokenId) > 0, "Not token holder");
-        require(role == 1 || role == 2, "Invalid role");
-        require(to != address(0), "Invalid address");
-        require(to != msg.sender, "Cannot grant to self");
-
-        bucketAccess[tokenId][to] = role;
-        emit AccessGranted(tokenId, to, role, block.timestamp);
-    }
-
-    /// @notice Revoke on-chain access
-    function revokeAccess(uint256 tokenId, address from) external {
-        require(balanceOf(msg.sender, tokenId) > 0, "Not token holder");
-        delete bucketAccess[tokenId][from];
-        emit AccessRevoked(tokenId, from, block.timestamp);
-    }
-
-    /// @notice Check if address has access to a token
-    /// @return role 0=none, 1=viewer, 2=editor, 3=owner
-    function hasAccess(uint256 tokenId, address account) external view returns (uint8) {
-        if (balanceOf(account, tokenId) > 0) return 3;
-        return bucketAccess[tokenId][account];
-    }
-
     function nextTokenId() external view returns (uint256) {
         return _nextTokenId;
     }
@@ -302,18 +288,23 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     }
 
     // ══════════════════════════════════════════════
-    //              MULTI-MINT VIEWS
+    //              ENUMERATION VIEWS
     // ══════════════════════════════════════════════
-
-    /// @notice Get all token IDs minted for a given profileId
-    function getProfileTokens(bytes16 profileId) external view returns (uint256[] memory) {
-        bytes32 profileHash = keccak256(abi.encodePacked(profileId));
-        return profileTokens[profileHash];
-    }
 
     /// @notice Get all token IDs owned by an address
     function getTokensByOwner(address owner) external view returns (uint256[] memory) {
         return _ownedTokens[owner];
+    }
+
+    /// @notice Get bucketHashes for every token an address currently holds.
+    ///         Backends use this as the canonical "what can this wallet access?" query.
+    function getBucketHashesByOwner(address owner) external view returns (bytes32[] memory) {
+        uint256[] memory tokens = _ownedTokens[owner];
+        bytes32[] memory hashes = new bytes32[](tokens.length);
+        for (uint256 i = 0; i < tokens.length; i++) {
+            hashes[i] = tokenToBucketHash[tokens[i]];
+        }
+        return hashes;
     }
 
     // ══════════════════════════════════════════════

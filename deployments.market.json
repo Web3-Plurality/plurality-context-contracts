@@ -1,0 +1,20 @@
+{
+  "stack": "market",
+  "network": "oasisSapphireTestnet",
+  "chainId": 23295,
+  "deployer": "0x49B330af2e9B16189a55d45bcf808d2D92bce1f6",
+  "contracts": {
+    "ContextRegistry": {
+      "address": "0x2520a3a637B8ecb40e02F003176536227Aafc563"
+    },
+    "PluralityMemoryNFT": {
+      "address": "0x7F44EB1EB4ffdfa301487D5898253bD2FEe736A2",
+      "registry": "0x2520a3a637B8ecb40e02F003176536227Aafc563",
+      "mintFee": "10000000000000000",
+      "feeRecipient": "0x49B330af2e9B16189a55d45bcf808d2D92bce1f6",
+      "royaltyBps": 500,
+      "marketplaceFeeBps": 250
+    }
+  },
+  "deployedAt": "2026-05-23T03:37:47.396Z"
+}

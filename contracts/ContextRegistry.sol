@@ -5,42 +5,48 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 
 /**
  * @title ContextRegistry
- * @notice ERC-8004-inspired decentralized content registry.
- *         Registers individual contexts (documents, chats, text) within
- *         minted memory buckets, storing content hashes for tamper-proof
- *         provenance verification.
+ * @notice ERC-8004-style append-only provenance registry for memory bucket
+ *         contexts. Each entry records (contentHash, bucketHash, registeredBy,
+ *         metadataURI, registeredAt, sourceType).
+ *
+ *         Flow: register-first, then mint. The user signs `registerContextBatch`
+ *         (tx1) to publish all contexts of a bucket on-chain. The first
+ *         registrant of a `bucketHash` claims it — only that wallet can later
+ *         mint the NFT (the NFT contract enforces this via `getBucketRegistrant`).
+ *
+ *         Pure append-only: no revoke, no metadata update. Provenance, once
+ *         recorded, is permanent. AccessControl is kept (DEFAULT_ADMIN_ROLE)
+ *         as a forward hook in case admin functions need to be added later.
  */
 contract ContextRegistry is AccessControl {
-    bytes32 public constant REGISTRAR_ROLE = keccak256("REGISTRAR_ROLE");
-
     struct ContextEntry {
-        bytes32 contentHash;       // SHA-256 of the original content
-        string metadataURI;        // IPFS URI to context metadata JSON
-        address registeredBy;      // Who registered it
-        uint256 registeredAt;      // Block timestamp
-        uint256 bucketTokenId;     // Reference to PluralityMemoryNFT tokenId
-        string sourceType;         // "file" | "chat" | "text"
-        bool revoked;              // Soft-delete flag
+        bytes32 contentHash;    // SHA-256 of the original content (provenance anchor)
+        bytes32 bucketHash;     // Memory bucket this context belongs to
+        address registeredBy;   // Wallet that signed the tx (creator at register time)
+        string  metadataURI;    // URI to context metadata JSON (off-chain)
+        uint256 registeredAt;   // Block timestamp
+        string  sourceType;     // "file" | "chat" | "text"
     }
 
     // contextId (UUID as bytes16) => ContextEntry
     mapping(bytes16 => ContextEntry) public contexts;
 
-    // bucketTokenId => array of contextIds
-    mapping(uint256 => bytes16[]) public bucketContexts;
+    // bucketHash => contextIds[] registered under it
+    mapping(bytes32 => bytes16[]) public bucketContexts;
 
-    // contentHash => contextId (reverse lookup for verification)
+    // contentHash => contextId (reverse lookup for verifyContent + provenance)
     mapping(bytes32 => bytes16) public hashToContext;
 
-    // Reference to the NFT contract
-    address public memoryNFT;
+    // bucketHash => the wallet that first registered contexts under it.
+    // The NFT contract reads this to enforce "only the registrant can mint".
+    mapping(bytes32 => address) public bucketRegistrant;
 
     // Stats
     uint256 public totalRegistered;
 
     event ContextRegistered(
         bytes16 indexed contextId,
-        uint256 indexed bucketTokenId,
+        bytes32 indexed bucketHash,
         bytes32 contentHash,
         string sourceType,
         string metadataURI,
@@ -48,142 +54,134 @@ contract ContextRegistry is AccessControl {
         uint256 timestamp
     );
 
-    event ContextRevoked(
-        bytes16 indexed contextId,
-        uint256 indexed bucketTokenId,
-        address revokedBy,
+    event BucketRegistrantClaimed(
+        bytes32 indexed bucketHash,
+        address indexed registrant,
         uint256 timestamp
     );
 
-    event ContextMetadataUpdated(
-        bytes16 indexed contextId,
-        string oldURI,
-        string newURI,
-        uint256 timestamp
-    );
-
-    constructor(address _memoryNFT) {
-        require(_memoryNFT != address(0), "Invalid NFT address");
-
+    constructor() {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(REGISTRAR_ROLE, msg.sender);
-        memoryNFT = _memoryNFT;
     }
 
-    /// @notice Register a context entry within a minted bucket
-    /// @param contextId Off-chain UUID as bytes16
-    /// @param bucketTokenId The NFT token ID of the parent bucket
-    /// @param contentHash SHA-256 hash of the original context content
-    /// @param sourceType "file", "chat", or "text"
-    /// @param metadataURI IPFS URI pointing to full context metadata
-    function registerContext(
-        bytes16 contextId,
-        uint256 bucketTokenId,
-        bytes32 contentHash,
-        string calldata sourceType,
-        string calldata metadataURI
-    ) external onlyRole(REGISTRAR_ROLE) {
-        require(contexts[contextId].registeredAt == 0, "Context already registered");
-        require(contentHash != bytes32(0), "Empty content hash");
-        require(bucketTokenId > 0, "Invalid bucket token ID");
+    // ══════════════════════════════════════════════
+    //                  REGISTER (batch-only)
+    // ══════════════════════════════════════════════
 
-        contexts[contextId] = ContextEntry({
-            contentHash: contentHash,
-            metadataURI: metadataURI,
-            registeredBy: msg.sender,
-            registeredAt: block.timestamp,
-            bucketTokenId: bucketTokenId,
-            sourceType: sourceType,
-            revoked: false
-        });
-
-        bucketContexts[bucketTokenId].push(contextId);
-        hashToContext[contentHash] = contextId;
-        totalRegistered++;
-
-        emit ContextRegistered(
-            contextId,
-            bucketTokenId,
-            contentHash,
-            sourceType,
-            metadataURI,
-            msg.sender,
-            block.timestamp
+    /// @notice Register multiple contexts of a single bucket on-chain in one tx.
+    /// @dev Permissionless. First caller to use a given bucketHash claims it;
+    ///      subsequent calls for the same bucketHash must come from the same
+    ///      address. This lets the NFT contract enforce "only the registrant
+    ///      can mint this bucket".
+    ///
+    /// @param bucketHash      SHA-256 Merkle of the contextHashes (computed off-chain)
+    /// @param contextIds      Per-context UUID (bytes16) — backend correlation key
+    /// @param contentHashes   Per-context SHA-256 of the raw content
+    /// @param metadataURIs    Per-context metadata URI
+    /// @param sourceTypes     Per-context source type ("file" | "chat" | "text")
+    function registerContextBatch(
+        bytes32 bucketHash,
+        bytes16[] calldata contextIds,
+        bytes32[] calldata contentHashes,
+        string[] calldata metadataURIs,
+        string[] calldata sourceTypes
+    ) external {
+        uint256 n = contextIds.length;
+        require(n > 0, "Empty batch");
+        require(bucketHash != bytes32(0), "Empty bucket hash");
+        require(
+            contentHashes.length == n && metadataURIs.length == n && sourceTypes.length == n,
+            "Length mismatch"
         );
+
+        // First registrant of a bucketHash claims it. Same address can extend
+        // (rare but supported); a different address would be rejected.
+        address existingRegistrant = bucketRegistrant[bucketHash];
+        if (existingRegistrant == address(0)) {
+            bucketRegistrant[bucketHash] = msg.sender;
+            emit BucketRegistrantClaimed(bucketHash, msg.sender, block.timestamp);
+        } else {
+            require(existingRegistrant == msg.sender, "Bucket claimed by another wallet");
+        }
+
+        for (uint256 i = 0; i < n; i++) {
+            bytes16 cid = contextIds[i];
+            bytes32 chash = contentHashes[i];
+
+            require(contexts[cid].registeredAt == 0, "Context already registered");
+            require(chash != bytes32(0), "Empty content hash");
+
+            contexts[cid] = ContextEntry({
+                contentHash:  chash,
+                bucketHash:   bucketHash,
+                registeredBy: msg.sender,
+                metadataURI:  metadataURIs[i],
+                registeredAt: block.timestamp,
+                sourceType:   sourceTypes[i]
+            });
+
+            bucketContexts[bucketHash].push(cid);
+            hashToContext[chash] = cid;
+
+            emit ContextRegistered(
+                cid,
+                bucketHash,
+                chash,
+                sourceTypes[i],
+                metadataURIs[i],
+                msg.sender,
+                block.timestamp
+            );
+        }
+
+        totalRegistered += n;
     }
 
-    /// @notice Verify that content matches a registered hash
-    /// @param contextId The context UUID as bytes16
-    /// @param contentHash The hash to verify against
-    /// @return True if content matches and context is not revoked
-    function verifyContent(
-        bytes16 contextId,
-        bytes32 contentHash
-    ) external view returns (bool) {
+    // ══════════════════════════════════════════════
+    //                   VIEWS
+    // ══════════════════════════════════════════════
+
+    /// @notice Verify a piece of content matches what was registered for `contextId`.
+    function verifyContent(bytes16 contextId, bytes32 contentHash) external view returns (bool) {
         ContextEntry memory entry = contexts[contextId];
-        return entry.registeredAt > 0 && !entry.revoked && entry.contentHash == contentHash;
+        return entry.registeredAt > 0 && entry.contentHash == contentHash;
     }
 
-    /// @notice Look up when a content hash was first registered
-    function getProvenanceByHash(
-        bytes32 contentHash
-    ) external view returns (
-        bytes16 contextId,
-        uint256 registeredAt,
-        address registeredBy,
-        uint256 bucketTokenId
-    ) {
+    /// @notice Look up provenance from a content hash.
+    function getProvenanceByHash(bytes32 contentHash)
+        external
+        view
+        returns (
+            bytes16 contextId,
+            uint256 registeredAt,
+            address registeredBy,
+            bytes32 bucketHash
+        )
+    {
         bytes16 cid = hashToContext[contentHash];
         ContextEntry memory entry = contexts[cid];
-        return (cid, entry.registeredAt, entry.registeredBy, entry.bucketTokenId);
+        return (cid, entry.registeredAt, entry.registeredBy, entry.bucketHash);
     }
 
-    /// @notice Get full context entry
-    function getContext(
-        bytes16 contextId
-    ) external view returns (ContextEntry memory) {
+    /// @notice Full context entry.
+    function getContext(bytes16 contextId) external view returns (ContextEntry memory) {
         return contexts[contextId];
     }
 
-    /// @notice Soft-delete a context (preserves provenance history)
-    function revokeContext(
-        bytes16 contextId
-    ) external onlyRole(REGISTRAR_ROLE) {
-        ContextEntry storage entry = contexts[contextId];
-        require(entry.registeredAt > 0, "Context not found");
-        require(!entry.revoked, "Already revoked");
-
-        entry.revoked = true;
-
-        emit ContextRevoked(contextId, entry.bucketTokenId, msg.sender, block.timestamp);
+    /// @notice All contextIds registered under a given bucketHash.
+    function getContextsByBucketHash(bytes32 bucketHash) external view returns (bytes16[] memory) {
+        return bucketContexts[bucketHash];
     }
 
-    /// @notice Update context metadata URI
-    function updateContextMetadata(
-        bytes16 contextId,
-        string calldata newURI
-    ) external onlyRole(REGISTRAR_ROLE) {
-        ContextEntry storage entry = contexts[contextId];
-        require(entry.registeredAt > 0, "Context not found");
-        require(!entry.revoked, "Context revoked");
-
-        string memory oldURI = entry.metadataURI;
-        entry.metadataURI = newURI;
-
-        emit ContextMetadataUpdated(contextId, oldURI, newURI, block.timestamp);
+    /// @notice How many contexts a bucketHash has on-chain.
+    function getBucketContextCount(bytes32 bucketHash) external view returns (uint256) {
+        return bucketContexts[bucketHash].length;
     }
 
-    /// @notice Get all context IDs for a bucket
-    function getBucketContextIds(
-        uint256 bucketTokenId
-    ) external view returns (bytes16[] memory) {
-        return bucketContexts[bucketTokenId];
-    }
-
-    /// @notice Get count of contexts in a bucket
-    function getBucketContextCount(
-        uint256 bucketTokenId
-    ) external view returns (uint256) {
-        return bucketContexts[bucketTokenId].length;
+    /// @notice The wallet that first registered contexts under this bucketHash.
+    ///         The NFT contract reads this to gate `mintBucket` — only the
+    ///         registrant can mint.
+    function getBucketRegistrant(bytes32 bucketHash) external view returns (address) {
+        return bucketRegistrant[bucketHash];
     }
 }

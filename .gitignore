@@ -30,6 +30,8 @@ yarn-error.log*
 /cache
 .eslintcache
 
+/typechain-types
+
 /logs
 
 # env
