@@ -14,7 +14,12 @@
       "feeRecipient": "0x49B330af2e9B16189a55d45bcf808d2D92bce1f6",
       "royaltyBps": 500,
       "marketplaceFeeBps": 250
+    },
+    "ReputationRegistry": {
+      "address": "0x07608CC4B2cB69EC6b0daE3D1aCaeE6fBd7040E1",
+      "nft": "0x7F44EB1EB4ffdfa301487D5898253bD2FEe736A2"
     }
   },
-  "deployedAt": "2026-05-23T03:37:47.396Z"
+  "deployedAt": "2026-05-23T03:37:47.396Z",
+  "lastUpdatedAt": "2026-05-31T15:34:59.558Z"
 }

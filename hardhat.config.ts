@@ -14,6 +14,10 @@ const config: HardhatUserConfig = {
         enabled: true,
         runs: 200,
       },
+      // viaIR needed for ReputationRegistry.giveFeedback — its emit takes
+      // many parameters (per ERC-8004 NewFeedback event schema) that overflow
+      // the legacy stack-based pipeline.
+      viaIR: true,
       evmVersion: "cancun",
     },
   },

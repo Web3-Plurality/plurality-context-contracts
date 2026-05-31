@@ -6,7 +6,8 @@
     "compile": "hardhat compile",
     "test": "hardhat test",
     "deploy:sapphire-testnet": "hardhat run scripts/deploy-market.ts --network oasisSapphireTestnet",
-    "deploy:sepolia": "hardhat run scripts/deploy-market.ts --network sepolia"
+    "deploy:sepolia": "hardhat run scripts/deploy-market.ts --network sepolia",
+    "deploy:reputation:sapphire-testnet": "hardhat run scripts/deploy-reputation.ts --network oasisSapphireTestnet"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",

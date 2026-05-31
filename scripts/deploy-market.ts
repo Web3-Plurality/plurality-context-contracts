@@ -1,6 +1,7 @@
 /**
  * Deployment script for the MARKET stack (Studio + C2C + BYOK Agent).
- * Deploys PluralityMemoryNFT + ContextRegistry to the target network.
+ * Deploys ContextRegistry + PluralityMemoryNFT + ReputationRegistry to the
+ * target network.
  *
  *  - Writes the resulting addresses to deployments.market.json (the canonical
  *    deployment record).
@@ -19,6 +20,7 @@
  *      plurality-market-backend/.env:
  *        MEMORY_NFT_CONTRACT_ADDRESS=...
  *        CONTEXT_REGISTRY_ADDRESS=...
+ *        REPUTATION_REGISTRY_ADDRESS=...
  */
 
 import { ethers } from "hardhat";
@@ -59,6 +61,15 @@ async function main() {
   const memoryNFTAddress = await memoryNFT.getAddress();
   console.log("[market deploy] PluralityMemoryNFT:", memoryNFTAddress);
 
+  // ReputationRegistry references the NFT (each tokenId is the agent identity
+  // it scores). Deploy AFTER the NFT.
+  console.log("\n[market deploy] --- ReputationRegistry ---");
+  const Reputation = await ethers.getContractFactory("ReputationRegistry");
+  const reputation = await Reputation.deploy(memoryNFTAddress);
+  await reputation.waitForDeployment();
+  const reputationAddress = await reputation.getAddress();
+  console.log("[market deploy] ReputationRegistry:", reputationAddress);
+
   const deployment = {
     stack: "market",
     network: (await ethers.provider.getNetwork()).name,
@@ -75,6 +86,10 @@ async function main() {
         feeRecipient,
         royaltyBps,
         marketplaceFeeBps,
+      },
+      ReputationRegistry: {
+        address: reputationAddress,
+        nft: memoryNFTAddress,
       },
     },
     deployedAt: new Date().toISOString(),
@@ -98,7 +113,7 @@ async function main() {
     }
   }
 
-  const contracts = ["PluralityMemoryNFT", "ContextRegistry"];
+  const contracts = ["PluralityMemoryNFT", "ContextRegistry", "ReputationRegistry"];
   for (const name of contracts) {
     const artifactPath = path.join(artifactsDir, `${name}.sol`, `${name}.json`);
     if (fs.existsSync(artifactPath)) {
@@ -115,6 +130,7 @@ async function main() {
   console.log("\n[market deploy] --- Done. Update plurality-market-backend/.env: ---");
   console.log(`  MEMORY_NFT_CONTRACT_ADDRESS=${memoryNFTAddress}`);
   console.log(`  CONTEXT_REGISTRY_ADDRESS=${registryAddress}`);
+  console.log(`  REPUTATION_REGISTRY_ADDRESS=${reputationAddress}`);
 }
 
 main()
