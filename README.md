@@ -107,6 +107,10 @@ Entry points:
 
 Only depends on `IERC1155.balanceOf` from the NFT contract; the rest is self-contained.
 
+### ValidationRegistry — intentionally omitted
+
+ERC-8004's `ValidationRegistry` exists for multi-validator ecosystems where a single backend cannot be trusted directly. In this stack the backend and AI service run inside Oasis ROFL (TEE-attested off-chain logic) with open-source code, and every memory context is independently anchored on-chain in `ContextRegistry`. The TEE-attested backend plus the on-chain provenance trail already provide the guarantee a validator layer is meant to give — adding one would create redundant trust paths without strengthening the actual assurance.
+
 ## Fee model
 
 All fees flow to the platform treasury (`feeRecipient`):
