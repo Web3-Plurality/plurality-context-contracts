@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
-
 /**
  * @title ContextRegistry
- * @notice ERC-8004-style append-only provenance registry for memory bucket
- *         contexts. Each entry records (contentHash, bucketHash, registeredBy,
- *         metadataURI, registeredAt, sourceType).
+ * @notice Append-only provenance registry for memory bucket contexts. Each
+ *         entry records (contentHash, bucketHash, registeredBy, metadataURI,
+ *         registeredAt, sourceType).
  *
  *         Flow: register-first, then mint. The user signs `registerContextBatch`
  *         (tx1) to publish all contexts of a bucket on-chain. The first
@@ -15,10 +13,15 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
  *         mint the NFT (the NFT contract enforces this via `getBucketRegistrant`).
  *
  *         Pure append-only: no revoke, no metadata update. Provenance, once
- *         recorded, is permanent. AccessControl is kept (DEFAULT_ADMIN_ROLE)
- *         as a forward hook in case admin functions need to be added later.
+ *         recorded, is permanent.
  */
-contract ContextRegistry is AccessControl {
+contract ContextRegistry {
+    // ── Hardening caps (per audit M-CR-1/2/4) ──────────────
+    uint256 public constant MAX_BATCH_SIZE = 256;
+    uint256 public constant MAX_CONTEXTS_PER_BUCKET = 1024;
+    uint256 public constant MAX_METADATA_URI_LENGTH = 1024;
+    uint256 public constant MAX_SOURCE_TYPE_LENGTH = 32;
+
     struct ContextEntry {
         bytes32 contentHash;    // SHA-256 of the original content (provenance anchor)
         bytes32 bucketHash;     // Memory bucket this context belongs to
@@ -34,7 +37,9 @@ contract ContextRegistry is AccessControl {
     // bucketHash => contextIds[] registered under it
     mapping(bytes32 => bytes16[]) public bucketContexts;
 
-    // contentHash => contextId (reverse lookup for verifyContent + provenance)
+    // contentHash => contextId — FIRST-WRITER-WINS (per audit H-CR-2).
+    // A second registration of the same contentHash leaves this mapping
+    // unchanged, preventing provenance spoofing via the reverse lookup.
     mapping(bytes32 => bytes16) public hashToContext;
 
     // bucketHash => the wallet that first registered contexts under it.
@@ -60,10 +65,6 @@ contract ContextRegistry is AccessControl {
         uint256 timestamp
     );
 
-    constructor() {
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-    }
-
     // ══════════════════════════════════════════════
     //                  REGISTER (batch-only)
     // ══════════════════════════════════════════════
@@ -73,12 +74,6 @@ contract ContextRegistry is AccessControl {
     ///      subsequent calls for the same bucketHash must come from the same
     ///      address. This lets the NFT contract enforce "only the registrant
     ///      can mint this bucket".
-    ///
-    /// @param bucketHash      SHA-256 Merkle of the contextHashes (computed off-chain)
-    /// @param contextIds      Per-context UUID (bytes16) — backend correlation key
-    /// @param contentHashes   Per-context SHA-256 of the raw content
-    /// @param metadataURIs    Per-context metadata URI
-    /// @param sourceTypes     Per-context source type ("file" | "chat" | "text")
     function registerContextBatch(
         bytes32 bucketHash,
         bytes16[] calldata contextIds,
@@ -88,10 +83,15 @@ contract ContextRegistry is AccessControl {
     ) external {
         uint256 n = contextIds.length;
         require(n > 0, "Empty batch");
+        require(n <= MAX_BATCH_SIZE, "Batch too large");
         require(bucketHash != bytes32(0), "Empty bucket hash");
         require(
             contentHashes.length == n && metadataURIs.length == n && sourceTypes.length == n,
             "Length mismatch"
+        );
+        require(
+            bucketContexts[bucketHash].length + n <= MAX_CONTEXTS_PER_BUCKET,
+            "Bucket context cap exceeded"
         );
 
         // First registrant of a bucketHash claims it. Same address can extend
@@ -110,6 +110,8 @@ contract ContextRegistry is AccessControl {
 
             require(contexts[cid].registeredAt == 0, "Context already registered");
             require(chash != bytes32(0), "Empty content hash");
+            require(bytes(metadataURIs[i]).length <= MAX_METADATA_URI_LENGTH, "URI too long");
+            require(bytes(sourceTypes[i]).length <= MAX_SOURCE_TYPE_LENGTH, "sourceType too long");
 
             contexts[cid] = ContextEntry({
                 contentHash:  chash,
@@ -121,7 +123,13 @@ contract ContextRegistry is AccessControl {
             });
 
             bucketContexts[bucketHash].push(cid);
-            hashToContext[chash] = cid;
+
+            // First-writer-wins on reverse lookup. Preserves the original
+            // provenance record when the same contentHash is registered again
+            // (intentionally or maliciously) under any other bucket or context.
+            if (hashToContext[chash] == bytes16(0)) {
+                hashToContext[chash] = cid;
+            }
 
             emit ContextRegistered(
                 cid,
@@ -147,7 +155,8 @@ contract ContextRegistry is AccessControl {
         return entry.registeredAt > 0 && entry.contentHash == contentHash;
     }
 
-    /// @notice Look up provenance from a content hash.
+    /// @notice Look up provenance from a content hash. Returns the FIRST
+    ///         registration of this contentHash (first-writer-wins).
     function getProvenanceByHash(bytes32 contentHash)
         external
         view

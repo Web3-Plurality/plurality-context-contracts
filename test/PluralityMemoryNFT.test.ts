@@ -120,7 +120,7 @@ describe("PluralityMemoryNFT — register-first mint", function () {
       ).to.be.revertedWith("Empty metadata URI");
     });
 
-    it("forwards mint fee to platform", async function () {
+    it("forwards mint fee to platform directly (hot-path push)", async function () {
       await registerOne(user1, BUCKET_HASH);
 
       const before = await ethers.provider.getBalance(platformWallet.address);
@@ -128,6 +128,31 @@ describe("PluralityMemoryNFT — register-first mint", function () {
       const after = await ethers.provider.getBalance(platformWallet.address);
 
       expect(after - before).to.equal(MINT_FEE);
+      // Hybrid: hot-path success leaves nothing in pendingWithdrawals.
+      expect(await nft.pendingWithdrawals(platformWallet.address)).to.equal(0n);
+    });
+
+    it("refunds mint-fee overpayment to the minter directly", async function () {
+      await registerOne(user1, BUCKET_HASH);
+      const overpay = MINT_FEE * 3n;
+
+      const before = await ethers.provider.getBalance(user1.address);
+      const tx = await nft.connect(user1).mintBucket(BUCKET_HASH, METADATA_URI, { value: overpay });
+      const receipt = await tx.wait();
+      const gas = receipt!.gasUsed * receipt!.gasPrice;
+      const after = await ethers.provider.getBalance(user1.address);
+
+      // Minter spent: gas + mintFee (the excess is refunded immediately).
+      expect(before - after).to.equal(MINT_FEE + gas);
+      expect(await nft.pendingWithdrawals(user1.address)).to.equal(0n);
+    });
+
+    it("rejects a second mint of the same bucketHash (audit M-NFT-6)", async function () {
+      await registerOne(user1, BUCKET_HASH);
+      await nft.connect(user1).mintBucket(BUCKET_HASH, METADATA_URI, { value: MINT_FEE });
+      await expect(
+        nft.connect(user1).mintBucket(BUCKET_HASH, METADATA_URI, { value: MINT_FEE }),
+      ).to.be.revertedWith("Bucket already minted");
     });
 
     it("increments token IDs across mints", async function () {
@@ -163,11 +188,94 @@ describe("PluralityMemoryNFT — register-first mint", function () {
       await nft.connect(user1).setApprovalForAll(await nft.getAddress(), true);
     });
 
-    it("lists a bucket for sale", async function () {
+    it("lists a bucket for sale and snapshots the current marketplace fee", async function () {
       const price = ethers.parseEther("1");
       await expect(nft.connect(user1).listBucket(1, price))
         .to.emit(nft, "BucketListed")
-        .withArgs(1, user1.address, price, (v: any) => true);
+        .withArgs(1, user1.address, price, MARKETPLACE_FEE_BPS, (v: any) => true);
+
+      const [seller, listedPrice, feeBpsAtList, active] = await nft.getListing(1);
+      expect(seller).to.equal(user1.address);
+      expect(listedPrice).to.equal(price);
+      expect(feeBpsAtList).to.equal(MARKETPLACE_FEE_BPS);
+      expect(active).to.equal(true);
+    });
+
+    it("uses the snapshot fee even if the admin changes marketplaceFeeBps after listing (audit M-NFT-4)", async function () {
+      const price = ethers.parseEther("1");
+      await nft.connect(user1).listBucket(1, price);
+
+      // Admin doubles the marketplace fee after the listing was created.
+      await nft.connect(owner).setMarketplaceFeeBps(MARKETPLACE_FEE_BPS * 2);
+
+      const oldFee = (price * BigInt(MARKETPLACE_FEE_BPS)) / 10000n;
+      const expectedSellerProceeds = price - oldFee;
+
+      const sellerBefore = await ethers.provider.getBalance(user1.address);
+      const platformBefore = await ethers.provider.getBalance(platformWallet.address);
+      await nft.connect(user2).buyBucket(1, { value: price });
+      const sellerAfter = await ethers.provider.getBalance(user1.address);
+      const platformAfter = await ethers.provider.getBalance(platformWallet.address);
+
+      // Both push payments succeed in the EOA case — settle using the
+      // snapshot fee, not the new (higher) admin value.
+      expect(sellerAfter - sellerBefore).to.equal(expectedSellerProceeds);
+      expect(platformAfter - platformBefore).to.equal(oldFee);
+    });
+
+    it("falls back to pendingWithdrawals when the seller rejects the direct push (audit H-NFT-2)", async function () {
+      // Deploy a contract that holds NFTs but reverts on ROSE receive.
+      const Reverting = await ethers.getContractFactory("RevertingReceiver");
+      const seller = await Reverting.deploy();
+      await seller.waitForDeployment();
+      const sellerAddr = await seller.getAddress();
+
+      // user1 already minted tokenId=1 in the parent beforeEach + approved.
+      // Transfer the NFT to the reverting contract, then approve + list from it.
+      await nft.connect(user1).safeTransferFrom(user1.address, sellerAddr, 1, 1, "0x");
+
+      const approveData = nft.interface.encodeFunctionData("setApprovalForAll", [
+        await nft.getAddress(),
+        true,
+      ]);
+      await seller.execute(await nft.getAddress(), approveData);
+
+      const listData = nft.interface.encodeFunctionData("listBucket", [
+        1,
+        ethers.parseEther("1"),
+      ]);
+      await seller.execute(await nft.getAddress(), listData);
+
+      // Buyer purchases — direct push to the reverting seller must fail and
+      // credit pendingWithdrawals instead.
+      const sellerProceeds =
+        ethers.parseEther("1") - (ethers.parseEther("1") * BigInt(MARKETPLACE_FEE_BPS)) / 10000n;
+
+      await nft.connect(user2).buyBucket(1, { value: ethers.parseEther("1") });
+
+      // The NFT moved to the buyer despite the push failure.
+      expect(await nft.balanceOf(user2.address, 1)).to.equal(1);
+      expect(await nft.balanceOf(sellerAddr, 1)).to.equal(0);
+
+      // Seller proceeds landed in pendingWithdrawals (push fallback).
+      expect(await nft.pendingWithdrawals(sellerAddr)).to.equal(sellerProceeds);
+    });
+
+    it("auto-clears a listing when seller transfers the NFT off-marketplace (audit H-NFT-1)", async function () {
+      await nft.connect(user1).listBucket(1, ethers.parseEther("1"));
+
+      // Seller transfers directly, bypassing buyBucket.
+      await nft.connect(user1).safeTransferFrom(user1.address, user2.address, 1, 1, "0x");
+
+      const [, , , active] = await nft.getListing(1);
+      expect(active).to.equal(false);
+
+      // The new holder can list it themselves now.
+      await nft.connect(user2).setApprovalForAll(await nft.getAddress(), true);
+      await expect(nft.connect(user2).listBucket(1, ethers.parseEther("2"))).to.emit(
+        nft,
+        "BucketListed",
+      );
     });
 
     it("reverts list when caller doesn't hold the token", async function () {
@@ -188,21 +296,25 @@ describe("PluralityMemoryNFT — register-first mint", function () {
         await nft.connect(user1).listBucket(1, SALE_PRICE);
       });
 
-      it("transfers NFT and pays seller minus platform fee", async function () {
-        const platformBefore = await ethers.provider.getBalance(platformWallet.address);
+      it("transfers NFT and pays seller minus platform fee (hot-path push)", async function () {
+        const expectedFee = (SALE_PRICE * BigInt(MARKETPLACE_FEE_BPS)) / 10000n;
+        const expectedSellerProceeds = SALE_PRICE - expectedFee;
+
         const sellerBefore = await ethers.provider.getBalance(user1.address);
+        const platformBefore = await ethers.provider.getBalance(platformWallet.address);
 
         await nft.connect(user2).buyBucket(1, { value: SALE_PRICE });
 
+        // NFT transferred
         expect(await nft.balanceOf(user2.address, 1)).to.equal(1);
         expect(await nft.balanceOf(user1.address, 1)).to.equal(0);
 
-        const platformAfter = await ethers.provider.getBalance(platformWallet.address);
-        const sellerAfter = await ethers.provider.getBalance(user1.address);
+        // Direct send succeeded for EOAs — funds land in their wallets immediately.
+        expect(await ethers.provider.getBalance(user1.address) - sellerBefore).to.equal(expectedSellerProceeds);
+        expect(await ethers.provider.getBalance(platformWallet.address) - platformBefore).to.equal(expectedFee);
 
-        const expectedFee = (SALE_PRICE * BigInt(MARKETPLACE_FEE_BPS)) / 10000n;
-        expect(platformAfter - platformBefore).to.equal(expectedFee);
-        expect(sellerAfter - sellerBefore).to.equal(SALE_PRICE - expectedFee);
+        // No pull-payment balances need claiming.
+        expect(await nft.pendingWithdrawals(user1.address)).to.equal(0n);
       });
 
       it("reverts if seller tries to buy own listing", async function () {
@@ -211,7 +323,7 @@ describe("PluralityMemoryNFT — register-first mint", function () {
         ).to.be.revertedWith("Cannot buy own listing");
       });
 
-      it("refunds excess payment", async function () {
+      it("refunds excess payment to buyer immediately (hot-path push)", async function () {
         const overpay = ethers.parseEther("2");
         const buyerBefore = await ethers.provider.getBalance(user2.address);
 
@@ -220,7 +332,9 @@ describe("PluralityMemoryNFT — register-first mint", function () {
         const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
 
         const buyerAfter = await ethers.provider.getBalance(user2.address);
+        // Net buyer cost = SALE_PRICE + gas (excess was refunded synchronously).
         expect(buyerBefore - buyerAfter).to.equal(SALE_PRICE + gasUsed);
+        expect(await nft.pendingWithdrawals(user2.address)).to.equal(0n);
       });
     });
   });

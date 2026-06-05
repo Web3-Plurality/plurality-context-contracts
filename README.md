@@ -7,13 +7,12 @@ On-chain provenance, ownership, and reputation layer for the Plurality memory ma
 
 | Contract | Address | Explorer |
 |---|---|---|
-| ContextRegistry | `0x2520a3a637B8ecb40e02F003176536227Aafc563` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x2520a3a637B8ecb40e02F003176536227Aafc563) |
-| PluralityMemoryNFT | `0x7F44EB1EB4ffdfa301487D5898253bD2FEe736A2` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x7F44EB1EB4ffdfa301487D5898253bD2FEe736A2) |
-| ReputationRegistry | `0x07608CC4B2cB69EC6b0daE3D1aCaeE6fBd7040E1` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x07608CC4B2cB69EC6b0daE3D1aCaeE6fBd7040E1) |
+| ContextRegistry | `0x34a86D8E06A0E9E82d1905184EbdEF735fd15399` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x34a86D8E06A0E9E82d1905184EbdEF735fd15399) |
+| PluralityMemoryNFT | `0x90d063A7ab5dB5141EeDd9293Ff45Db2F1Fa42B2` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x90d063A7ab5dB5141EeDd9293Ff45Db2F1Fa42B2) |
+| ReputationRegistry | `0x54904385330D05F90c899371e040fb760d216a23` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x54904385330D05F90c899371e040fb760d216a23) |
 
 Deployer / fee recipient: `0x49B330af2e9B16189a55d45bcf808d2D92bce1f6`
-ContextRegistry + PluralityMemoryNFT deployed at: `2026-05-23T03:37:47Z`
-ReputationRegistry deployed at: `2026-05-31T15:46:Z` (supersedes prior `0x4Cdb85…` deployment)
+Deployed at: `2026-06-05T15:30Z` (audit-fix redeploy with hybrid payment pattern)
 Full deployment record: [`deployments.market.json`](deployments.market.json)
 
 ## Architecture
@@ -115,13 +114,15 @@ ERC-8004's `ValidationRegistry` exists for multi-validator ecosystems where a si
 
 All fees flow to the platform treasury (`feeRecipient`):
 
-| Fee | Default | Configurable by | Notes |
-|---|---|---|---|
-| Mint fee | `0.01 ROSE` (10⁻²) | `DEFAULT_ADMIN_ROLE` | Charged on every `mintBucket` |
-| ERC-2981 royalty | 500 bps (5%) | `DEFAULT_ADMIN_ROLE` (≤10000) | Reported to external marketplaces via ERC-2981 |
-| Built-in marketplace commission | 250 bps (2.5%) | `DEFAULT_ADMIN_ROLE` (≤5000 / max 50%) | Deducted from sale price in `buyBucket`; seller gets the remainder |
+| Fee | Default | Configurable by | Cap | Notes |
+|---|---|---|---|---|
+| Mint fee | `0.01 ROSE` (10⁻²) | `DEFAULT_ADMIN_ROLE` | — | Charged on every `mintBucket`; pushed to treasury synchronously |
+| ERC-2981 royalty | 500 bps (5%) | `DEFAULT_ADMIN_ROLE` | `MAX_ROYALTY_BPS` = 1000 bps (10%) | Reported to external marketplaces via ERC-2981 |
+| Built-in marketplace commission | 250 bps (2.5%) | `DEFAULT_ADMIN_ROLE` | `MAX_MARKETPLACE_FEE_BPS` = 1000 bps (10%) | Deducted from sale price in `buyBucket`; snapshot at list time so an admin fee change can't rug a live listing |
 
 The ERC-2981 royalty recipient is the platform, not the creator. This is a deliberate platform-fee design rather than the conventional creator-royalty default.
+
+All value flows (seller proceeds, platform commission, buyer refunds, mint-fee remittance) use a hybrid payment pattern: the contract first attempts a direct push with a 50,000-gas limit; if the recipient reverts or runs out of gas, the amount is credited to `pendingWithdrawals[recipient]` and claimable via `withdraw()`. In the common EOA case the recipient is paid synchronously; the fallback only triggers when the recipient is a contract that rejects ROSE.
 
 ## Quick start
 
@@ -132,7 +133,7 @@ npm install
 # Compile
 npx hardhat compile
 
-# Test (71 tests, ~4s)
+# Test (80 tests, ~5s)
 npx hardhat test
 
 # Fresh deploy of all three contracts to Oasis Sapphire Testnet
@@ -153,9 +154,33 @@ npm run deploy:reputation:sapphire-testnet
 | `DEPLOYER_PRIVATE_KEY` | `hardhat.config.ts` | Deploying to any non-local network |
 | `SEPOLIA_RPC_URL` | `hardhat.config.ts` | Deploying to Sepolia (optional) |
 
+## Security
+
+An internal adversarial review was performed across all three contracts before the testnet submission. No findings were Critical. The following remediations were applied and are covered by tests in the suite:
+
+**ContextRegistry**
+- First-writer-wins on the `hashToContext` reverse lookup. A second registration of an already-recorded `contentHash` no longer overwrites the original provenance record, preventing spoofing of `getProvenanceByHash`.
+- Hard caps on `registerContextBatch`: `MAX_BATCH_SIZE = 256`, `MAX_CONTEXTS_PER_BUCKET = 1024`, `MAX_METADATA_URI_LENGTH = 1024 bytes`, `MAX_SOURCE_TYPE_LENGTH = 32 bytes`. Prevents per-bucket unbounded growth that would otherwise eventually break the `getContextsByBucketHash` view.
+- `AccessControl` inheritance dropped — no role-gated function exists, and the dangling `DEFAULT_ADMIN_ROLE` was a forward attack surface only.
+
+**PluralityMemoryNFT**
+- Hybrid payment model: seller proceeds, platform commission, buyer refunds, and the mint-fee remittance are first attempted via a gas-limited direct `.call`. If that push fails (recipient reverts, runs out of gas, or has no `receive`), the amount is credited to `pendingWithdrawals[recipient]` and claimable via `withdraw()`. EOAs and well-behaved contracts get paid synchronously; a reverting seller can no longer grief buys (audit H-NFT-2).
+- Auto-clearing of stale listings: when the listed seller transfers the NFT outside the built-in marketplace, the `_update` hook clears `listings[tokenId].active`. Previously a stale listing could permanently brick a tokenId's marketplace presence.
+- Snapshot of `marketplaceFeeBps` into the `Listing` struct at list time. An admin fee change between list and buy can no longer rug the seller.
+- `nonReentrant` on `mintBucket` (formerly only on `buyBucket`).
+- Duplicate-mint guard: `bucketHashToTokenId` mapping rejects a second `mintBucket` for the same `bucketHash`.
+- Tightened admin caps: `MAX_ROYALTY_BPS = 1000` (10%, was 100%), `MAX_MARKETPLACE_FEE_BPS = 1000` (10%, was 50%).
+- Mint-fee overpayment refunded via pull-payment (was previously kept silently by the treasury).
+
+**ReputationRegistry**
+- On-chain hardening caps: `MAX_CLIENTS_PER_AGENT = 1000`, `MAX_FEEDBACK_PER_PAIR = 50`, `MAX_RESPONSES_PER_FEEDBACK = 50`. Prevents Sybil-flooding from permanently DoS-ing the `getSummary` / `readAllFeedback` / `getClients` views.
+- Documentation corrected on the "approved operator" deviation — operators of any wallet (including EOAs) can submit feedback in this implementation; the omission is narrowly scoped to the ERC-1155 ↔ ERC-721 gap and explicitly called out.
+
+One additional finding is deferred to a future deployment: a wallet-bound `bucketHash` derivation (`keccak256(creator, contentMerkleRoot)` instead of the raw Merkle root) would close a front-running window that depends on off-chain leaks of the `bucketHash`. This requires a coordinated change across the contract, the backend bucket-hash logic, and the DB schema, and is scheduled for the M3+ ROFL-backend deployment where the leak path itself is eliminated.
+
 ## Verification
 
-Source verification on the Oasis Sapphire Testnet explorer should be run after each deploy. As of the latest deployment record (`2026-05-23`), verification status should be confirmed via the explorer links above. If sources are not visible there, run the hardhat-verify or sourcify pipeline as appropriate for Oasis Sapphire.
+Source verification on the Oasis Sapphire Testnet explorer should be run after each deploy. Verification status should be confirmed via the explorer links above. If sources are not visible there, run the hardhat-verify or sourcify pipeline as appropriate for Oasis Sapphire.
 
 ## Repository layout
 

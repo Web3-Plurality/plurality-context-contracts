@@ -32,17 +32,17 @@ describe("ContextRegistry — append-only, batch-only, registrant-claim", functi
   });
 
   describe("Deployment", function () {
-    it("grants admin role to deployer", async function () {
-      const adminRole = await registry.DEFAULT_ADMIN_ROLE();
-      expect(await registry.hasRole(adminRole, admin.address)).to.be.true;
-    });
-
     it("starts with zero registrations", async function () {
       expect(await registry.totalRegistered()).to.equal(0);
     });
 
     it("returns zero address for an unclaimed bucketHash", async function () {
       expect(await registry.getBucketRegistrant(BUCKET_HASH)).to.equal(ethers.ZeroAddress);
+    });
+
+    it("exposes audit-set caps as public constants", async function () {
+      expect(await registry.MAX_BATCH_SIZE()).to.equal(256n);
+      expect(await registry.MAX_CONTEXTS_PER_BUCKET()).to.equal(1024n);
     });
   });
 
@@ -230,6 +230,62 @@ describe("ContextRegistry — append-only, batch-only, registrant-claim", functi
     it("returns the full context list for a bucketHash", async function () {
       const ids = await registry.getContextsByBucketHash(BUCKET_HASH);
       expect(ids).to.deep.equal([CTX1, CTX2, CTX3]);
+    });
+  });
+
+  describe("Audit hardening — first-writer-wins on hashToContext (H-CR-2)", function () {
+    it("preserves the original (contextId, registrant, bucket) for a contentHash", async function () {
+      // Alice registers HASH1 under bucket BUCKET_HASH with context CTX1.
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], ["file"]);
+
+      // Bob registers the SAME HASH1 under a different bucket + contextId.
+      await registry
+        .connect(bob)
+        .registerContextBatch(BUCKET_HASH_2, [CTX2], [HASH1], [URI2], ["file"]);
+
+      // Reverse lookup must still return Alice's original record, not Bob's.
+      const [cid, , registeredBy, bucketHash] = await registry.getProvenanceByHash(HASH1);
+      expect(cid).to.equal(CTX1);
+      expect(registeredBy).to.equal(alice.address);
+      expect(bucketHash).to.equal(BUCKET_HASH);
+    });
+  });
+
+  describe("Audit hardening — input caps", function () {
+    it("rejects a batch larger than MAX_BATCH_SIZE", async function () {
+      const oversize = 257;
+      const ids = new Array(oversize).fill(0).map((_, i) => {
+        const hex = i.toString(16).padStart(32, "0");
+        return ("0x" + hex) as `0x${string}`;
+      });
+      const hashes = new Array(oversize).fill(0).map((_, i) =>
+        ethers.keccak256(ethers.toUtf8Bytes(`payload-${i}`)),
+      );
+      const uris = new Array(oversize).fill("ipfs://x");
+      const sources = new Array(oversize).fill("file");
+      await expect(
+        registry.connect(alice).registerContextBatch(BUCKET_HASH, ids, hashes, uris, sources),
+      ).to.be.revertedWith("Batch too large");
+    });
+
+    it("rejects a metadataURI longer than the cap", async function () {
+      const longUri = "x".repeat(1025);
+      await expect(
+        registry
+          .connect(alice)
+          .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [longUri], ["file"]),
+      ).to.be.revertedWith("URI too long");
+    });
+
+    it("rejects a sourceType longer than the cap", async function () {
+      const longSource = "x".repeat(33);
+      await expect(
+        registry
+          .connect(alice)
+          .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], [longSource]),
+      ).to.be.revertedWith("sourceType too long");
     });
   });
 });

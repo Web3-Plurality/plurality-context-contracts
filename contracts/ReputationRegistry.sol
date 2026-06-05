@@ -21,17 +21,30 @@ import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
  *     getClients / getLastIndex / getIdentityRegistry match spec signatures.
  *   - The "feedback submitter MUST NOT be the agent owner" rule is enforced
  *     via ERC-1155 balanceOf instead of ERC-721 ownerOf (semantic equivalent).
- *   - The companion "MUST NOT be an approved operator" rule is documented as
- *     a known omission — ERC-1155 lacks an ownerOf() function so the registry
- *     cannot resolve the current holder address required to query
- *     isApprovedForAll. Approved-operator attacks remain possible at the
- *     contract layer but are not a meaningful risk in this marketplace
- *     (the only approved operator is the NFT contract itself, which is a
- *     contract, not an EOA leaving feedback).
+ *   - The companion "MUST NOT be an approved operator" rule is NOT enforced
+ *     at the contract layer. Resolving "approved operator of the current
+ *     holder" requires `ownerOf` to call `isApprovedForAll(owner, sender)`,
+ *     which ERC-1155 alone cannot do without an explicit enumeration mapping
+ *     on the NFT contract. Approved operators (whoever they may be — EOAs
+ *     are eligible, not just contracts) can therefore submit feedback. This
+ *     is documented as a known deviation from the spec, narrowly scoped to
+ *     the ERC-1155 ↔ ERC-721 gap.
  *   - Sybil resistance and complex aggregation are delegated to off-chain
- *     consumers per the spec's explicit design philosophy.
+ *     consumers per the spec's explicit design philosophy. On-chain caps
+ *     (below) provide a basic floor against view-function DoS.
  */
 contract ReputationRegistry {
+    // ── Hardening caps (audit H-REP-1/2) ───────────────────
+    /// @notice Max distinct clients that may post feedback on a single agent.
+    ///         Bounds the iteration cost of `getSummary` / `readAllFeedback`
+    ///         / `getClients` and prevents permanent view-function DoS via
+    ///         Sybil flooding.
+    uint64 public constant MAX_CLIENTS_PER_AGENT = 1000;
+    /// @notice Max feedback rows per (agent, client) pair.
+    uint64 public constant MAX_FEEDBACK_PER_PAIR = 50;
+    /// @notice Max responses per feedback row (any responder).
+    uint64 public constant MAX_RESPONSES_PER_FEEDBACK = 50;
+
     // ── Storage layout ──────────────────────────────────────
 
     struct Feedback {
@@ -132,6 +145,22 @@ contract ReputationRegistry {
         // Spec MUST: valueDecimals in [0, 18].
         require(valueDecimals <= 18, "valueDecimals must be 0-18");
 
+        // Hardening (audit H-REP-1/2): cap per-(agent,client) feedback rows
+        // to bound the inner loop of getSummary / readAllFeedback.
+        require(
+            _feedbacks[agentId][msg.sender].length < MAX_FEEDBACK_PER_PAIR,
+            "Feedback cap reached for this agent"
+        );
+        // Cap distinct clients per agent to bound the outer loop. Once an
+        // address has posted at least once it remains eligible to extend
+        // without re-counting toward the cap.
+        if (!_clientSeen[agentId][msg.sender]) {
+            require(
+                _clients[agentId].length < MAX_CLIENTS_PER_AGENT,
+                "Client cap reached for this agent"
+            );
+        }
+
         uint64 feedbackIndex = uint64(_feedbacks[agentId][msg.sender].length);
 
         _feedbacks[agentId][msg.sender].push(
@@ -187,6 +216,12 @@ contract ReputationRegistry {
         require(
             feedbackIndex < _feedbacks[agentId][clientAddress].length,
             "No such feedback"
+        );
+
+        // Hardening (audit H-REP-2): cap responses per feedback row.
+        require(
+            _responses[agentId][clientAddress][feedbackIndex].length < MAX_RESPONSES_PER_FEEDBACK,
+            "Response cap reached"
         );
 
         _responses[agentId][clientAddress][feedbackIndex].push(

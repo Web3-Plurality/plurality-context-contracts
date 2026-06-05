@@ -5,21 +5,20 @@
   "deployer": "0x49B330af2e9B16189a55d45bcf808d2D92bce1f6",
   "contracts": {
     "ContextRegistry": {
-      "address": "0x2520a3a637B8ecb40e02F003176536227Aafc563"
+      "address": "0x34a86D8E06A0E9E82d1905184EbdEF735fd15399"
     },
     "PluralityMemoryNFT": {
-      "address": "0x7F44EB1EB4ffdfa301487D5898253bD2FEe736A2",
-      "registry": "0x2520a3a637B8ecb40e02F003176536227Aafc563",
+      "address": "0x90d063A7ab5dB5141EeDd9293Ff45Db2F1Fa42B2",
+      "registry": "0x34a86D8E06A0E9E82d1905184EbdEF735fd15399",
       "mintFee": "10000000000000000",
       "feeRecipient": "0x49B330af2e9B16189a55d45bcf808d2D92bce1f6",
       "royaltyBps": 500,
       "marketplaceFeeBps": 250
     },
     "ReputationRegistry": {
-      "address": "0x07608CC4B2cB69EC6b0daE3D1aCaeE6fBd7040E1",
-      "nft": "0x7F44EB1EB4ffdfa301487D5898253bD2FEe736A2"
+      "address": "0x54904385330D05F90c899371e040fb760d216a23",
+      "nft": "0x90d063A7ab5dB5141EeDd9293Ff45Db2F1Fa42B2"
     }
   },
-  "deployedAt": "2026-05-23T03:37:47.396Z",
-  "lastUpdatedAt": "2026-05-31T15:34:59.558Z"
+  "deployedAt": "2026-06-05T14:18:41.330Z"
 }
