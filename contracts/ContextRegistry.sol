@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
+/// Minimal interface the registry needs from PluralityMemoryNFT to enforce
+/// "post-mint freeze" on bucket context appends.
+interface IBucketMintLookup {
+    function bucketHashToTokenId(bytes32 bucketHash) external view returns (uint256);
+}
+
 /**
  * @title ContextRegistry
  * @notice Append-only provenance registry for memory bucket contexts. Each
@@ -14,8 +20,21 @@ pragma solidity ^0.8.27;
  *
  *         Pure append-only: no revoke, no metadata update. Provenance, once
  *         recorded, is permanent.
+ *
+ *         Post-mint freeze: once a bucketHash has been minted as an NFT, no
+ *         further context appends are accepted for it (audit v3 H-5). This
+ *         keeps the on-chain "what the NFT covers" set immutable from the
+ *         buyer's perspective and prevents an original registrant from
+ *         silently adding contexts under a bucket they've already sold.
+ *         The freeze is wired via a one-time `setNftRegistry` call by the
+ *         deployer immediately after the NFT contract is deployed; this is
+ *         the only function with privileged access, and it can only succeed
+ *         once.
  */
 contract ContextRegistry {
+    /// @notice Identifier surfaced for off-chain ABI / deployment-drift checks.
+    string public constant VERSION = "ContextRegistry/v5";
+
     // ── Hardening caps (per audit M-CR-1/2/4) ──────────────
     uint256 public constant MAX_BATCH_SIZE = 256;
     uint256 public constant MAX_CONTEXTS_PER_BUCKET = 1024;
@@ -46,13 +65,20 @@ contract ContextRegistry {
     // The NFT contract reads this to enforce "only the registrant can mint".
     mapping(bytes32 => address) public bucketRegistrant;
 
+    // Deployer + one-time NFT wiring (post-mint freeze plumbing, audit v3 H-5).
+    address public immutable deployer;
+    IBucketMintLookup public nftRegistry;
+
     // Stats
     uint256 public totalRegistered;
 
+    /// @notice Emitted on every successful context registration. `contentHash`
+    ///         is indexed so off-chain consumers can filter provenance by
+    ///         content (audit v3 M-8).
     event ContextRegistered(
         bytes16 indexed contextId,
         bytes32 indexed bucketHash,
-        bytes32 contentHash,
+        bytes32 indexed contentHash,
         string sourceType,
         string metadataURI,
         address registeredBy,
@@ -64,6 +90,35 @@ contract ContextRegistry {
         address indexed registrant,
         uint256 timestamp
     );
+
+    event NftRegistryLinked(address indexed nftRegistry);
+
+    constructor() {
+        deployer = msg.sender;
+    }
+
+    /// @notice One-time wiring of the NFT contract address. Callable only by
+    ///         the deployer, and only when `nftRegistry` has not yet been
+    ///         set. After this call, `registerContextBatch` rejects any
+    ///         append against a bucketHash that has already been minted as
+    ///         an NFT, locking the registered context set from the buyer's
+    ///         perspective.
+    ///
+    ///         The deployer holds no other privileges. There is no setter
+    ///         for any registered data, no admin role, no upgrade path.
+    function setNftRegistry(address nftAddress) external {
+        require(msg.sender == deployer, "Only deployer");
+        require(address(nftRegistry) == address(0), "Already set");
+        require(nftAddress != address(0), "Invalid address");
+        // Sanity-probe (audit v4 CR-H-2): refuse to wire to an EOA or to a
+        // contract that doesn't implement the lookup. Without this check a
+        // fat-fingered deploy permanently breaks every future
+        // `registerContextBatch` (one-shot setter — no recovery path).
+        require(nftAddress.code.length > 0, "Not a contract");
+        IBucketMintLookup(nftAddress).bucketHashToTokenId(bytes32(0));
+        nftRegistry = IBucketMintLookup(nftAddress);
+        emit NftRegistryLinked(nftAddress);
+    }
 
     // ══════════════════════════════════════════════
     //                  REGISTER (batch-only)
@@ -93,6 +148,19 @@ contract ContextRegistry {
             bucketContexts[bucketHash].length + n <= MAX_CONTEXTS_PER_BUCKET,
             "Bucket context cap exceeded"
         );
+
+        // Post-mint freeze (audit v3 H-5). Once `setNftRegistry` is wired and
+        // an NFT has been minted for this bucketHash, no further appends are
+        // allowed — the registered set the NFT represents is locked from the
+        // buyer's perspective. Reverting here is more useful than relying on
+        // off-chain enforcement: a confused front-end can't accidentally
+        // mutate the bucket post-sale.
+        if (address(nftRegistry) != address(0)) {
+            require(
+                nftRegistry.bucketHashToTokenId(bucketHash) == 0,
+                "Bucket already minted"
+            );
+        }
 
         // First registrant of a bucketHash claims it. Same address can extend
         // (rare but supported); a different address would be rejected.

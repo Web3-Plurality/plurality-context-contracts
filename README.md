@@ -7,12 +7,13 @@ On-chain provenance, ownership, and reputation layer for the Plurality memory ma
 
 | Contract | Address | Explorer |
 |---|---|---|
-| ContextRegistry | `0x34a86D8E06A0E9E82d1905184EbdEF735fd15399` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x34a86D8E06A0E9E82d1905184EbdEF735fd15399) |
-| PluralityMemoryNFT | `0x90d063A7ab5dB5141EeDd9293Ff45Db2F1Fa42B2` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x90d063A7ab5dB5141EeDd9293Ff45Db2F1Fa42B2) |
-| ReputationRegistry | `0x54904385330D05F90c899371e040fb760d216a23` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x54904385330D05F90c899371e040fb760d216a23) |
+| ContextRegistry | `0x9A374905B2B286344fCac6f754dCF40F3cb427d5` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x9A374905B2B286344fCac6f754dCF40F3cb427d5) |
+| PluralityMemoryNFT | `0xDe5dB30AE86e27F1E7EeC0AD353d910C4Ca93D08` | [view](https://explorer.oasis.io/testnet/sapphire/address/0xDe5dB30AE86e27F1E7EeC0AD353d910C4Ca93D08) |
+| ReputationRegistry | `0x8D0027e715943FB2f215c884369B744861331E3E` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x8D0027e715943FB2f215c884369B744861331E3E) |
 
 Deployer / fee recipient: `0x49B330af2e9B16189a55d45bcf808d2D92bce1f6`
-Deployed at: `2026-06-05T15:30Z` (audit-fix redeploy with hybrid payment pattern)
+Atomic deploy via DeployHelper: `0xefC7d00794DE1882001a386D0FF40DD1D1c7BB87`
+Deployed at: `2026-06-06T00:00Z` (v5 deployment — fourth-pass audit remediations, mainnet-ready)
 Full deployment record: [`deployments.market.json`](deployments.market.json)
 
 ## Architecture
@@ -98,17 +99,13 @@ Extends: `ERC1155`, `ERC2981` (royalties), `AccessControl`, `Pausable`, `Reentra
 Typed feedback on each bucket, with the data model and entry points from ERC-8004's ReputationRegistry: per-agent feedback with value + decimals + two tags + endpoint + optional content URI, multiple entries per (agent, client) pair, revocable, with multi-responder responses and tag/client-filterable aggregates.
 
 Entry points:
-- `giveFeedback(agentId, value, valueDecimals, tag1, tag2, endpoint, feedbackURI, feedbackHash)` — `int128 value`, `uint8 valueDecimals` ∈ [0, 18]. Caller must not currently hold the bucket NFT. Each call appends a row; emits `NewFeedback` with the new `feedbackIndex`.
+- `giveFeedback(agentId, value, valueDecimals, tag1, tag2, endpoint, feedbackURI, feedbackHash)` — `int128 value`, `uint8 valueDecimals` ∈ [0, 8] (spec allows [0, 18] but we tightened to bound the rescale factor in `getSummary`). Caller must not currently hold the bucket NFT. Each call appends a row; emits `NewFeedback` with the new `feedbackIndex`.
 - `revokeFeedback(agentId, feedbackIndex)` — soft revoke. The row stays marked `isRevoked` for transparency.
 - `appendResponse(agentId, clientAddress, feedbackIndex, responseURI, responseHash)` — open to any caller; multiple responders per feedback row.
 - `getSummary(agentId, clientAddresses[], tag1, tag2) → (count, summaryValue, summaryValueDecimals)` — filtered aggregate. Mixed `valueDecimals` are normalized to the max seen before averaging.
 - `readFeedback`, `readAllFeedback`, `getResponseCount`, `getClients`, `getLastIndex`, `getIdentityRegistry` — the read surface.
 
 Only depends on `IERC1155.balanceOf` from the NFT contract; the rest is self-contained.
-
-### ValidationRegistry — intentionally omitted
-
-ERC-8004's `ValidationRegistry` exists for multi-validator ecosystems where a single backend cannot be trusted directly. In this stack the backend and AI service run inside Oasis ROFL (TEE-attested off-chain logic) with open-source code, and every memory context is independently anchored on-chain in `ContextRegistry`. The TEE-attested backend plus the on-chain provenance trail already provide the guarantee a validator layer is meant to give — adding one would create redundant trust paths without strengthening the actual assurance.
 
 ## Fee model
 
@@ -122,7 +119,7 @@ All fees flow to the platform treasury (`feeRecipient`):
 
 The ERC-2981 royalty recipient is the platform, not the creator. This is a deliberate platform-fee design rather than the conventional creator-royalty default.
 
-All value flows (seller proceeds, platform commission, buyer refunds, mint-fee remittance) use a hybrid payment pattern: the contract first attempts a direct push with a 50,000-gas limit; if the recipient reverts or runs out of gas, the amount is credited to `pendingWithdrawals[recipient]` and claimable via `withdraw()`. In the common EOA case the recipient is paid synchronously; the fallback only triggers when the recipient is a contract that rejects ROSE.
+All value flows (seller proceeds, platform commission, buyer refunds, mint-fee remittance) use a hybrid payment pattern: the contract first attempts a direct push with a 150,000-gas limit (enough headroom for Gnosis Safe / ERC-4337 smart-wallet receive paths); if the recipient reverts or runs out of gas, the amount is credited to `pendingWithdrawals[recipient]` and claimable via `withdraw()`. In the common EOA case the recipient is paid synchronously; the fallback only triggers when the recipient is a contract that rejects ROSE.
 
 ## Quick start
 
@@ -132,9 +129,6 @@ npm install
 
 # Compile
 npx hardhat compile
-
-# Test (80 tests, ~5s)
-npx hardhat test
 
 # Fresh deploy of all three contracts to Oasis Sapphire Testnet
 # (e.g. for a new stack). Requires DEPLOYER_PRIVATE_KEY in .env.
@@ -154,34 +148,6 @@ npm run deploy:reputation:sapphire-testnet
 | `DEPLOYER_PRIVATE_KEY` | `hardhat.config.ts` | Deploying to any non-local network |
 | `SEPOLIA_RPC_URL` | `hardhat.config.ts` | Deploying to Sepolia (optional) |
 
-## Security
-
-An internal adversarial review was performed across all three contracts before the testnet submission. No findings were Critical. The following remediations were applied and are covered by tests in the suite:
-
-**ContextRegistry**
-- First-writer-wins on the `hashToContext` reverse lookup. A second registration of an already-recorded `contentHash` no longer overwrites the original provenance record, preventing spoofing of `getProvenanceByHash`.
-- Hard caps on `registerContextBatch`: `MAX_BATCH_SIZE = 256`, `MAX_CONTEXTS_PER_BUCKET = 1024`, `MAX_METADATA_URI_LENGTH = 1024 bytes`, `MAX_SOURCE_TYPE_LENGTH = 32 bytes`. Prevents per-bucket unbounded growth that would otherwise eventually break the `getContextsByBucketHash` view.
-- `AccessControl` inheritance dropped — no role-gated function exists, and the dangling `DEFAULT_ADMIN_ROLE` was a forward attack surface only.
-
-**PluralityMemoryNFT**
-- Hybrid payment model: seller proceeds, platform commission, buyer refunds, and the mint-fee remittance are first attempted via a gas-limited direct `.call`. If that push fails (recipient reverts, runs out of gas, or has no `receive`), the amount is credited to `pendingWithdrawals[recipient]` and claimable via `withdraw()`. EOAs and well-behaved contracts get paid synchronously; a reverting seller can no longer grief buys (audit H-NFT-2).
-- Auto-clearing of stale listings: when the listed seller transfers the NFT outside the built-in marketplace, the `_update` hook clears `listings[tokenId].active`. Previously a stale listing could permanently brick a tokenId's marketplace presence.
-- Snapshot of `marketplaceFeeBps` into the `Listing` struct at list time. An admin fee change between list and buy can no longer rug the seller.
-- `nonReentrant` on `mintBucket` (formerly only on `buyBucket`).
-- Duplicate-mint guard: `bucketHashToTokenId` mapping rejects a second `mintBucket` for the same `bucketHash`.
-- Tightened admin caps: `MAX_ROYALTY_BPS = 1000` (10%, was 100%), `MAX_MARKETPLACE_FEE_BPS = 1000` (10%, was 50%).
-- Mint-fee overpayment refunded via pull-payment (was previously kept silently by the treasury).
-
-**ReputationRegistry**
-- On-chain hardening caps: `MAX_CLIENTS_PER_AGENT = 1000`, `MAX_FEEDBACK_PER_PAIR = 50`, `MAX_RESPONSES_PER_FEEDBACK = 50`. Prevents Sybil-flooding from permanently DoS-ing the `getSummary` / `readAllFeedback` / `getClients` views.
-- Documentation corrected on the "approved operator" deviation — operators of any wallet (including EOAs) can submit feedback in this implementation; the omission is narrowly scoped to the ERC-1155 ↔ ERC-721 gap and explicitly called out.
-
-One additional finding is deferred to a future deployment: a wallet-bound `bucketHash` derivation (`keccak256(creator, contentMerkleRoot)` instead of the raw Merkle root) would close a front-running window that depends on off-chain leaks of the `bucketHash`. This requires a coordinated change across the contract, the backend bucket-hash logic, and the DB schema, and is scheduled for the M3+ ROFL-backend deployment where the leak path itself is eliminated.
-
-## Verification
-
-Source verification on the Oasis Sapphire Testnet explorer should be run after each deploy. Verification status should be confirmed via the explorer links above. If sources are not visible there, run the hardhat-verify or sourcify pipeline as appropriate for Oasis Sapphire.
-
 ## Repository layout
 
 ```
@@ -189,14 +155,11 @@ contracts/
   ContextRegistry.sol         # ERC-8004-aligned provenance registry
   PluralityMemoryNFT.sol      # ERC-1155 memory-bucket NFT + marketplace
   ReputationRegistry.sol      # ERC-8004-inspired reputation, per tokenId
+  DeployHelper.sol            # v5: atomic 3-contract deploy + wiring
 scripts/
-  deploy-market.ts            # Fresh deploy of all three contracts
+  deploy-market.ts            # Fresh deploy via DeployHelper (atomic)
   deploy-reputation.ts        # Incremental deploy of ReputationRegistry only,
                               # attaches to the existing NFT address
-test/
-  ContextRegistry.test.ts        # provenance registry tests
-  PluralityMemoryNFT.test.ts     # NFT + marketplace tests
-  ReputationRegistry.test.ts     # eligibility + update-persistence tests
 deployments.market.json       # Live testnet addresses + constructor params
 hardhat.config.ts             # Networks: oasisSapphireTestnet, sepolia
 ```

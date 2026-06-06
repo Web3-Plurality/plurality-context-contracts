@@ -46,12 +46,17 @@ interface IContextRegistry {
  *         changes are committed.
  */
 contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, ReentrancyGuard {
-    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    /// @notice Identifier surfaced for off-chain ABI / deployment-drift checks.
+    string public constant VERSION = "PluralityMemoryNFT/v5";
 
     /// @notice Hard cap on royaltyBps (10%). Protects sellers on external
     ///         marketplaces from a 100%-royalty rug by the admin (audit M-NFT-3).
     uint96 public constant MAX_ROYALTY_BPS = 1000;
     uint96 public constant MAX_MARKETPLACE_FEE_BPS = 1000; // 10% — also tightened (was 50%)
+    /// @notice Cap on a single `migratePerTokenRoyalty` batch. Keeps the tx
+    ///         well within Sapphire's block gas limit and bounds admin gas
+    ///         per call (audit v4 NFT-M-3).
+    uint256 public constant MAX_ROYALTY_MIGRATION_BATCH = 500;
 
     // ──── Fee system (all fees go to platform) ────
     uint256 public mintFee;
@@ -89,9 +94,13 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     mapping(address => uint256) public pendingWithdrawals;
 
     /// @notice Gas forwarded to recipients during the push-payment leg.
-    ///         50,000 is generous enough for any reasonable EOA / contract
-    ///         wallet receive hook, tight enough to bound griefing.
-    uint256 private constant PUSH_GAS_LIMIT = 50000;
+    ///         150,000 is enough for Gnosis Safe 1.3+ / Safe{Core} / ERC-4337
+    ///         smart accounts (which often consume 40–80k just for proxied
+    ///         receive + guard checks), while still bounding griefing well
+    ///         below the typical buy-tx budget (~250k+). Empirically chosen
+    ///         after the audit-v2 review flagged 50k as too tight for the
+    ///         common smart-wallet cohort.
+    uint256 private constant PUSH_GAS_LIMIT = 150000;
 
     // ──── Marketplace ────
     struct Listing {
@@ -106,7 +115,7 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     event BucketMinted(
         uint256 indexed tokenId,
         address indexed creator,
-        bytes32 bucketHash,
+        bytes32 indexed bucketHash,
         string metadataURI,
         uint256 timestamp
     );
@@ -138,6 +147,26 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         uint256 timestamp
     );
 
+    /// @notice Emitted when the `_update` hook auto-clears a stale listing
+    ///         because the listed seller transferred the NFT outside the
+    ///         built-in marketplace. Distinct from `BucketDelisted` (which
+    ///         is the explicit user-initiated path).
+    event BucketListingAutoCleared(
+        uint256 indexed tokenId,
+        address indexed seller,
+        address indexed transferredTo,
+        uint256 timestamp
+    );
+
+    /// @notice Emitted by `migratePerTokenRoyalty` after an admin batch
+    ///         re-stamps per-token royalty overrides to the current
+    ///         `feeRecipient` + `royaltyBps`.
+    event PerTokenRoyaltyMigrated(
+        uint256 indexed tokenCount,
+        address indexed newRecipient,
+        uint96 newBps
+    );
+
     event BucketSold(
         uint256 indexed tokenId,
         address indexed seller,
@@ -152,18 +181,26 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
 
     constructor(
         address _registry,
+        address _admin,
         address _feeRecipient,
         uint256 _mintFee,
         uint96 _royaltyBps,
         uint96 _marketplaceFeeBps
     ) ERC1155("") {
         require(_registry != address(0), "Invalid registry");
+        require(_admin != address(0), "Invalid admin");
         require(_feeRecipient != address(0), "Invalid fee recipient");
         require(_royaltyBps <= MAX_ROYALTY_BPS, "Royalty too high");
         require(_marketplaceFeeBps <= MAX_MARKETPLACE_FEE_BPS, "Marketplace fee too high");
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(MINTER_ROLE, msg.sender);
+        // Sanity-probe the registry address (audit v4 COMP-H-2). A wrong /
+        // malicious registry that doesn't expose `getBucketContextCount` would
+        // revert this constructor call, blocking deploys that wired the NFT
+        // to anything other than a real ContextRegistry.
+        require(_registry.code.length > 0, "Registry not a contract");
+        IContextRegistry(_registry).getBucketContextCount(bytes32(0));
+
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
 
         registry = IContextRegistry(_registry);
         feeRecipient = _feeRecipient;
@@ -235,10 +272,19 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
 
     /// @notice List a bucket NFT for sale. The current `marketplaceFeeBps` is
     ///         snapshot into the listing so an admin fee change cannot rug
-    ///         the seller mid-flow (audit M-NFT-4).
+    ///         the seller mid-flow (audit M-NFT-4). Note the symmetric
+    ///         consequence: an admin *lowering* the fee after a listing was
+    ///         created does NOT cut the snapshot — the seller continues to
+    ///         pay the old (higher) rate until they delist + relist.
+    ///         Frontends should read `getListing(...).feeBps` to display the
+    ///         actual rate that will apply at sale.
     function listBucket(uint256 tokenId, uint256 price) external whenNotPaused {
         require(balanceOf(msg.sender, tokenId) > 0, "Not token holder");
         require(price > 0, "Price must be > 0");
+        // Cap price at 2^128 - 1 to prevent `price * marketplaceFeeBps` from
+        // overflowing under any conceivable bps value (audit v3 M-2). At
+        // current ROSE economics, 2^128 wei is ~3.4 × 10^20 ROSE — galactic.
+        require(price <= type(uint128).max, "Price too high");
         require(!listings[tokenId].active, "Already listed");
 
         // Seller must approve this contract to transfer on their behalf
@@ -287,6 +333,19 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         uint256 price = listing.price;
         uint96 feeBps = listing.marketplaceFeeBpsAtList;
 
+        // Fail-fast before pushing any value: if the seller revoked the
+        // contract's approval (or transferred the token out without auto-
+        // clear firing for whatever reason), the trailing `_safeTransferFrom`
+        // would revert AFTER `_payOrCredit` already moved funds. Solidity
+        // 0.8 rolls back the whole tx in that case so funds are safe, but
+        // the buyer wastes gas. Cheap upfront check protects them. Audit v4
+        // NFT-M-1.
+        require(balanceOf(seller, tokenId) > 0, "Seller no longer holds token");
+        require(
+            isApprovedForAll(seller, address(this)),
+            "Seller revoked marketplace approval"
+        );
+
         // Effects: deactivate listing before any external interaction.
         listings[tokenId].active = false;
 
@@ -324,6 +383,11 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
 
     /// @notice Withdraw your accumulated marketplace proceeds, mint-fee
     ///         remittances, or buyer refunds.
+    /// @dev Intentionally NOT gated by `whenNotPaused`. If the platform pauses
+    ///      the contract in response to an active incident, users must always
+    ///      retain the ability to recover funds the contract has already
+    ///      credited to them. Pausing freezes the buy/mint/list write paths
+    ///      while leaving this exit open is the safer policy.
     function withdraw() external nonReentrant {
         uint256 amount = pendingWithdrawals[msg.sender];
         require(amount > 0, "Nothing to withdraw");
@@ -347,8 +411,12 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     //                  METADATA
     // ══════════════════════════════════════════════
 
-    /// @notice Update metadata URI (only token holder)
-    function updateMetadata(uint256 tokenId, string calldata newURI) external {
+    /// @notice Update metadata URI (only token holder). Gated by `whenNotPaused`
+    ///         per audit v3 M-1: pause must freeze all writable state.
+    function updateMetadata(uint256 tokenId, string calldata newURI)
+        external
+        whenNotPaused
+    {
         require(balanceOf(msg.sender, tokenId) > 0, "Not token holder");
         require(bytes(newURI).length > 0, "Empty URI");
 
@@ -377,6 +445,10 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
 
     /// @notice Get bucketHashes for every token an address currently holds.
     ///         Backends use this as the canonical "what can this wallet access?" query.
+    /// @dev For large holders or wallets that have received many incoming
+    ///      transfers, prefer the paginated variant below — an unbounded
+    ///      caller is a potential off-chain DoS vector when the array grows
+    ///      past the RPC's `eth_call` gas ceiling.
     function getBucketHashesByOwner(address owner) external view returns (bytes32[] memory) {
         uint256[] memory tokens = _ownedTokens[owner];
         bytes32[] memory hashes = new bytes32[](tokens.length);
@@ -386,15 +458,91 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         return hashes;
     }
 
+    /// @notice Paginated variant of `getBucketHashesByOwner` that bounds
+    ///         per-call iteration cost. Backends should iterate with
+    ///         `start = nextStart` until `nextStart == 0`.
+    /// @param  start   Index into `_ownedTokens[owner]` to start at.
+    /// @param  limit   Maximum number of bucketHashes to return.
+    /// @return hashes      The slice of bucketHashes (length ≤ limit).
+    /// @return nextStart   Next index to query, or 0 if iteration is complete.
+    function getBucketHashesByOwnerPaginated(
+        address owner,
+        uint256 start,
+        uint256 limit
+    ) external view returns (bytes32[] memory hashes, uint256 nextStart) {
+        uint256[] memory tokens = _ownedTokens[owner];
+        uint256 len = tokens.length;
+        if (start >= len || limit == 0) {
+            return (new bytes32[](0), 0);
+        }
+        uint256 end = start + limit;
+        if (end > len) end = len;
+        uint256 outLen = end - start;
+        hashes = new bytes32[](outLen);
+        for (uint256 i = 0; i < outLen; i++) {
+            hashes[i] = tokenToBucketHash[tokens[start + i]];
+        }
+        nextStart = end < len ? end : 0;
+    }
+
+    /// @notice How many tokens `owner` currently holds. Cheap helper so
+    ///         paginating callers can size their loops without fetching
+    ///         the full token array.
+    function ownedTokenCount(address owner) external view returns (uint256) {
+        return _ownedTokens[owner].length;
+    }
+
     // ══════════════════════════════════════════════
     //            ERC1155 OVERRIDE
     // ══════════════════════════════════════════════
+
+    /// @notice Pause-gated override of ERC-1155 single transfer (audit v4
+    ///         NFT-H-1). The inherited `_update` hook does NOT honor pause
+    ///         by default; gating the public transfer surface here ensures
+    ///         the "pause freezes the access-token" invariant the NatSpec
+    ///         promises actually holds.
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        uint256 value,
+        bytes memory data
+    ) public override whenNotPaused {
+        super.safeTransferFrom(from, to, id, value, data);
+    }
+
+    /// @notice Pause-gated override of ERC-1155 batch transfer (audit v4
+    ///         NFT-H-1).
+    function safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory values,
+        bytes memory data
+    ) public override whenNotPaused {
+        super.safeBatchTransferFrom(from, to, ids, values, data);
+    }
 
     /// @dev Override _update to maintain `_ownedTokens` enumeration AND to
     ///      auto-clear stale marketplace listings when the listed seller
     ///      transfers the token outside the built-in marketplace (audit H-NFT-1).
     ///      Without this, listing.active stays true forever, bricking the
     ///      tokenId's marketplace presence.
+    ///
+    ///      Important: ERC-1155 `safeBatchTransferFrom` permits the same
+    ///      `tokenId` to appear multiple times in `ids[]` with mixed values
+    ///      (including zero). Without the `values[i] == 0` short-circuit
+    ///      below, an attacker could call
+    ///      `safeBatchTransferFrom(self, victim, [tid, tid, tid], [1, 0, 0], "")`
+    ///      and the recipient's `_ownedTokens` array would gain three copies
+    ///      of `tid` even though their actual balance is 1, permanently
+    ///      corrupting `getTokensByOwner`/`getBucketHashesByOwner` for that
+    ///      victim. The `BucketListingAutoCleared` event would also fire
+    ///      multiple times for one logical transfer. Audit v3 H-1 fix.
+    ///
+    ///      The `from == to` short-circuit prevents a listed seller from
+    ///      silently delisting via a self-transfer that fires an auto-clear
+    ///      event indexers may not track (audit v4 NFT-H-2).
     function _update(
         address from,
         address to,
@@ -403,7 +551,18 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
     ) internal override {
         super._update(from, to, ids, values);
 
+        // Self-transfers are logical no-ops for enumeration + listing state.
+        // Returning early avoids transient remove/re-push churn and
+        // suppresses spurious `BucketListingAutoCleared` events that would
+        // desync indexers tracking only `BucketDelisted`. (Audit v4 NFT-H-2.)
+        if (from == to) return;
+
         for (uint256 i = 0; i < ids.length; i++) {
+            // Skip zero-value transfers — they don't move supply, and
+            // processing them on a duplicate `tokenId` in a batch would
+            // corrupt our enumeration array (see NatSpec above).
+            if (values[i] == 0) continue;
+
             uint256 tokenId = ids[i];
 
             if (from != address(0)) {
@@ -412,11 +571,13 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
                 // Auto-clear listing if the listed seller is the one losing
                 // the token. The `buyBucket` path already clears the listing
                 // before _update fires (active == false), so this only triggers
-                // when the seller transfers outside the marketplace.
+                // when the seller transfers outside the marketplace. The
+                // dedicated `BucketListingAutoCleared` event lets indexers
+                // distinguish auto-clears from explicit user delists.
                 Listing storage listing = listings[tokenId];
                 if (listing.active && listing.seller == from) {
                     listing.active = false;
-                    emit BucketDelisted(tokenId, from, block.timestamp);
+                    emit BucketListingAutoCleared(tokenId, from, to, block.timestamp);
                 }
             }
 
@@ -452,11 +613,44 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         require(_feeRecipient != address(0), "Invalid address");
         address oldRecipient = feeRecipient;
         feeRecipient = _feeRecipient;
-        // Update ERC-2981 default royalty recipient. Note: per-token royalties
-        // set at mint time still reference the OLD recipient; rotate at deploy-
-        // time only or accept this trade-off (audit M-NFT-2 documented).
+        // Update ERC-2981 default royalty. Per-token overrides set at mint
+        // time still reference the OLD recipient; call `migratePerTokenRoyalty`
+        // below to re-stamp them in batches.
         _setDefaultRoyalty(_feeRecipient, royaltyBps);
         emit FeeRecipientUpdated(oldRecipient, _feeRecipient);
+    }
+
+    /// @notice Re-stamp per-token ERC-2981 royalty overrides to the current
+    ///         `feeRecipient` + `royaltyBps`. `_setTokenRoyalty` is called
+    ///         per-token in `mintBucket`, so a `setFeeRecipient` alone does
+    ///         NOT route royalties for already-minted tokens to the new
+    ///         recipient. Call this in batches after rotating the treasury
+    ///         (compromise rotation, multisig migration, custody change).
+    /// @param  tokenIds  Token IDs whose royalty override should be refreshed.
+    function migratePerTokenRoyalty(uint256[] calldata tokenIds)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(
+            tokenIds.length <= MAX_ROYALTY_MIGRATION_BATCH,
+            "Batch too large"
+        );
+        address recipient = feeRecipient;
+        uint96 bps = royaltyBps;
+        uint256 nextId = _nextTokenId;
+        uint256 count = 0;
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            uint256 tid = tokenIds[i];
+            // Skip impossible IDs (0 is the unused sentinel; > _nextTokenId
+            // is unminted). The `tokenCreator != 0` check then ensures we
+            // never touch a burned/cleared row (audit v3 M-3).
+            if (tid == 0 || tid > nextId) continue;
+            if (tokenCreator[tid] != address(0)) {
+                _setTokenRoyalty(tid, recipient, bps);
+                count++;
+            }
+        }
+        emit PerTokenRoyaltyMigrated(count, recipient, bps);
     }
 
     function setMarketplaceFeeBps(uint96 _bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -466,6 +660,10 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
         emit MarketplaceFeeUpdated(oldBps, _bps);
     }
 
+    /// @notice Update the default royalty bps. Same trade-off as
+    ///         `setFeeRecipient`: per-token overrides set at mint time still
+    ///         reference the OLD value. Call `migratePerTokenRoyalty` in
+    ///         batches afterward to re-stamp them (audit v3 M-4).
     function setRoyaltyBps(uint96 _bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_bps <= MAX_ROYALTY_BPS, "Royalty too high");
         uint96 oldBps = royaltyBps;

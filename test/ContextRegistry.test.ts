@@ -44,6 +44,10 @@ describe("ContextRegistry — append-only, batch-only, registrant-claim", functi
       expect(await registry.MAX_BATCH_SIZE()).to.equal(256n);
       expect(await registry.MAX_CONTEXTS_PER_BUCKET()).to.equal(1024n);
     });
+
+    it("exposes the v5 version stamp", async function () {
+      expect(await registry.VERSION()).to.equal("ContextRegistry/v5");
+    });
   });
 
   describe("registerContextBatch — happy path", function () {
@@ -286,6 +290,103 @@ describe("ContextRegistry — append-only, batch-only, registrant-claim", functi
           .connect(alice)
           .registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], [longSource]),
       ).to.be.revertedWith("sourceType too long");
+    });
+  });
+
+  describe("v4 hardening — NFT wiring + post-mint freeze (audit v3 H-5)", function () {
+    it("only the deployer can wire setNftRegistry", async function () {
+      // v5 — probe requires a real contract address. Use the registry's own
+      // address as a stand-in (it doesn't expose bucketHashToTokenId, so the
+      // probe will revert, but this test only exercises the "Only deployer"
+      // guard which runs before the probe).
+      await expect(registry.connect(alice).setNftRegistry(alice.address)).to.be.revertedWith(
+        "Only deployer",
+      );
+    });
+
+    it("rejects zero address in setNftRegistry", async function () {
+      await expect(registry.setNftRegistry(ethers.ZeroAddress)).to.be.revertedWith(
+        "Invalid address",
+      );
+    });
+
+    it("rejects an EOA in setNftRegistry (v5 CR-H-2 probe)", async function () {
+      // An EOA has no code; the probe must reject before persisting state.
+      await expect(registry.setNftRegistry(alice.address)).to.be.revertedWith(
+        "Not a contract",
+      );
+    });
+
+    it("can only be wired once", async function () {
+      // Deploy a real NFT so the probe passes the first time.
+      const MINT_FEE = ethers.parseEther("0.01");
+      const NFT = await ethers.getContractFactory("PluralityMemoryNFT");
+      const nft = await NFT.deploy(
+        await registry.getAddress(),
+        admin.address,
+        admin.address,
+        MINT_FEE,
+        500,
+        250,
+      );
+      await nft.waitForDeployment();
+
+      await registry.setNftRegistry(await nft.getAddress());
+      await expect(registry.setNftRegistry(await nft.getAddress())).to.be.revertedWith(
+        "Already set",
+      );
+    });
+
+    it("rejects context appends to bucketHashes that are already minted", async function () {
+      // Deploy the full stack so we can simulate a mint.
+      const Registry = await ethers.getContractFactory("ContextRegistry");
+      const r = await Registry.deploy();
+      await r.waitForDeployment();
+
+      const MINT_FEE = ethers.parseEther("0.01");
+      const NFT = await ethers.getContractFactory("PluralityMemoryNFT");
+      const nft = await NFT.deploy(
+        await r.getAddress(),
+        admin.address,         // v5 — explicit admin
+        admin.address,
+        MINT_FEE,
+        500,
+        250,
+      );
+      await nft.waitForDeployment();
+      await r.setNftRegistry(await nft.getAddress());
+
+      // Alice registers + mints.
+      await r.connect(alice).registerContextBatch(BUCKET_HASH, [CTX1], [HASH1], [URI1], ["file"]);
+      await nft
+        .connect(alice)
+        .mintBucket(BUCKET_HASH, "https://example.com/bucket/1", { value: MINT_FEE });
+
+      // Alice attempts to append a new context to the SAME bucketHash post-mint.
+      // The freeze must reject — preventing orphan-context drift after sale.
+      await expect(
+        r.connect(alice).registerContextBatch(BUCKET_HASH, [CTX2], [HASH2], [URI2], ["chat"]),
+      ).to.be.revertedWith("Bucket already minted");
+
+      // Different bucketHash still works.
+      await expect(
+        r.connect(alice).registerContextBatch(BUCKET_HASH_2, [CTX3], [HASH3], [URI3], ["text"]),
+      ).to.emit(r, "ContextRegistered");
+    });
+
+    it("contentHash is indexed in ContextRegistered (audit v3 M-8)", async function () {
+      // Filter logs by contentHash should return only matching events.
+      await registry
+        .connect(alice)
+        .registerContextBatch(BUCKET_HASH, [CTX1, CTX2], [HASH1, HASH2], [URI1, URI2], [
+          "file",
+          "chat",
+        ]);
+
+      const filter = registry.filters.ContextRegistered(undefined, undefined, HASH1);
+      const events = await registry.queryFilter(filter, 0, "latest");
+      expect(events.length).to.equal(1);
+      expect(events[0].args.contextId).to.equal(CTX1);
     });
   });
 });

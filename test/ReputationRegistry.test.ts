@@ -62,12 +62,16 @@ describe("ReputationRegistry — ERC-8004-faithful (multi-feedback, decimals, ta
     const NFT = await ethers.getContractFactory("PluralityMemoryNFT");
     nft = await NFT.deploy(
       await registry.getAddress(),
+      owner.address,           // v5 — explicit admin
       platformWallet.address,
       MINT_FEE,
       ROYALTY_BPS,
       MARKETPLACE_FEE_BPS,
     );
     await nft.waitForDeployment();
+
+    // CR↔NFT wiring (production uses DeployHelper to do this atomically).
+    await registry.setNftRegistry(await nft.getAddress());
 
     const Reputation = await ethers.getContractFactory("ReputationRegistry");
     reputation = await Reputation.deploy(await nft.getAddress());
@@ -140,12 +144,16 @@ describe("ReputationRegistry — ERC-8004-faithful (multi-feedback, decimals, ta
       ).to.emit(reputation, "NewFeedback");
     });
 
-    it("rejects valueDecimals > 18", async function () {
+    it("rejects valueDecimals > 8 (v3 M-6: tightened from spec's 18)", async function () {
       const tokenId = await mintBucket(creator, BUCKET_HASH);
       await transferViaMarketplace(creator, buyer, tokenId);
       await expect(
-        reputation.connect(stranger).giveFeedback(tokenId, 1, 19, "", "", "", "", ethers.ZeroHash),
-      ).to.be.revertedWith("valueDecimals must be 0-18");
+        reputation.connect(stranger).giveFeedback(tokenId, 1, 9, "", "", "", "", ethers.ZeroHash),
+      ).to.be.revertedWith("valueDecimals must be 0-8");
+      // Boundary accepted
+      await expect(
+        reputation.connect(stranger).giveFeedback(tokenId, 1, 8, "", "", "", "", ethers.ZeroHash),
+      ).to.emit(reputation, "NewFeedback");
     });
   });
 
@@ -159,8 +167,14 @@ describe("ReputationRegistry — ERC-8004-faithful (multi-feedback, decimals, ta
       await reputation.connect(stranger).giveFeedback(tokenId, 2, 0, "b", "", "", "", ethers.ZeroHash);
       await reputation.connect(stranger).giveFeedback(tokenId, 3, 0, "c", "", "", "", ethers.ZeroHash);
 
-      const last = await reputation.getLastIndex(tokenId, stranger.address);
+      const [last, exists] = await reputation.getLastIndex(tokenId, stranger.address);
       expect(last).to.equal(2n);
+      expect(exists).to.equal(true);
+
+      // Sanity: never-posted address returns (0, false).
+      const [nonLast, nonExists] = await reputation.getLastIndex(tokenId, owner.address);
+      expect(nonLast).to.equal(0n);
+      expect(nonExists).to.equal(false);
 
       const fb0 = await reputation.readFeedback(tokenId, stranger.address, 0);
       const fb1 = await reputation.readFeedback(tokenId, stranger.address, 1);
@@ -396,6 +410,111 @@ describe("ReputationRegistry — ERC-8004-faithful (multi-feedback, decimals, ta
       );
       expect(clientsIn).to.have.lengthOf(1);
       expect(revokedStatuses[0]).to.equal(true);
+    });
+  });
+
+  describe("v3 hardening — active feedback cap with revoke-slot reuse (audit M-REP-B)", function () {
+    it("revoking frees a slot so a non-revoked client can post again", async function () {
+      const tokenId = await mintBucket(creator, BUCKET_HASH);
+      await transferViaMarketplace(creator, buyer, tokenId);
+
+      // Post 5 active feedback rows.
+      for (let i = 0; i < 5; i++) {
+        await reputation
+          .connect(stranger)
+          .giveFeedback(tokenId, i + 1, 0, "tag", "", "", "", ethers.ZeroHash);
+      }
+      expect(await reputation.getActiveFeedbackCount(tokenId, stranger.address)).to.equal(5n);
+
+      // Revoke 3 of them.
+      await reputation.connect(stranger).revokeFeedback(tokenId, 0);
+      await reputation.connect(stranger).revokeFeedback(tokenId, 1);
+      await reputation.connect(stranger).revokeFeedback(tokenId, 2);
+      expect(await reputation.getActiveFeedbackCount(tokenId, stranger.address)).to.equal(2n);
+
+      // Active count is back to 2; new feedback can be posted (the audit M-REP-B
+      // fix — previous version would have rejected because length cap was on
+      // total rows including revoked).
+      await expect(
+        reputation
+          .connect(stranger)
+          .giveFeedback(tokenId, 9, 0, "tag", "", "", "", ethers.ZeroHash),
+      ).to.emit(reputation, "NewFeedback");
+
+      expect(await reputation.getActiveFeedbackCount(tokenId, stranger.address)).to.equal(3n);
+    });
+
+    it("getLastIndex disambiguates 'never posted' from 'posted at index 0' (L-REP-A)", async function () {
+      const tokenId = await mintBucket(creator, BUCKET_HASH);
+
+      // Never posted → (0, false).
+      const [idxA, existsA] = await reputation.getLastIndex(tokenId, stranger.address);
+      expect(idxA).to.equal(0n);
+      expect(existsA).to.equal(false);
+
+      // Post one → (0, true).
+      await transferViaMarketplace(creator, buyer, tokenId);
+      await reputation
+        .connect(stranger)
+        .giveFeedback(tokenId, 1, 0, "", "", "", "", ethers.ZeroHash);
+      const [idxB, existsB] = await reputation.getLastIndex(tokenId, stranger.address);
+      expect(idxB).to.equal(0n);
+      expect(existsB).to.equal(true);
+    });
+
+    it("public caps reflect the v4 values (audit H-4: client cap reverted to 1000)", async function () {
+      expect(await reputation.MAX_CLIENTS_PER_AGENT()).to.equal(1000n);
+      expect(await reputation.MAX_FEEDBACK_PER_PAIR()).to.equal(50n);
+      expect(await reputation.MAX_FEEDBACK_HISTORY_PER_PAIR()).to.equal(200n);
+      expect(await reputation.MAX_RESPONSES_PER_FEEDBACK()).to.equal(50n);
+    });
+  });
+
+  describe("v4 hardening — agent owner bypasses response cap (audit v3 M-5)", function () {
+    it("non-owner responses are capped, but the current NFT holder can still respond", async function () {
+      const tokenId = await mintBucket(creator, BUCKET_HASH);
+      await transferViaMarketplace(creator, buyer, tokenId);
+      // stranger leaves a piece of feedback to respond to.
+      await reputation
+        .connect(stranger)
+        .giveFeedback(tokenId, 4, 0, "tag", "", "", "", ethers.ZeroHash);
+
+      // Fill the response cap (50) with non-owner responders. We use the same
+      // non-owner address repeatedly here — the cap is on length, not unique
+      // responders, so the effect is the same as a Sybil flood.
+      for (let i = 0; i < 50; i++) {
+        await reputation
+          .connect(nextBuyer)
+          .appendResponse(tokenId, stranger.address, 0, "ipfs://shill", ethers.ZeroHash);
+      }
+
+      // The next non-owner response is blocked.
+      await expect(
+        reputation
+          .connect(nextBuyer)
+          .appendResponse(tokenId, stranger.address, 0, "ipfs://blocked", ethers.ZeroHash),
+      ).to.be.revertedWith("Response cap reached");
+
+      // But the agent owner (buyer holds the NFT) can still respond — their
+      // rebuttal right is preserved.
+      await expect(
+        reputation
+          .connect(buyer)
+          .appendResponse(tokenId, stranger.address, 0, "ipfs://owner-rebuttal", ethers.ZeroHash),
+      ).to.emit(reputation, "ResponseAppended");
+    });
+  });
+
+  describe("v5 hardening — VERSION + constructor probe", function () {
+    it("exposes the v5 version stamp", async function () {
+      expect(await reputation.VERSION()).to.equal("ReputationRegistry/v5");
+    });
+
+    it("rejects an EOA identity registry (probe)", async function () {
+      const Reputation = await ethers.getContractFactory("ReputationRegistry");
+      await expect(Reputation.deploy(stranger.address)).to.be.revertedWith(
+        "Identity registry not a contract",
+      );
     });
   });
 });

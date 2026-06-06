@@ -2,6 +2,7 @@
 pragma solidity ^0.8.27;
 
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 /**
  * @title ReputationRegistry
@@ -34,14 +35,27 @@ import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
  *     (below) provide a basic floor against view-function DoS.
  */
 contract ReputationRegistry {
-    // ── Hardening caps (audit H-REP-1/2) ───────────────────
+    /// @notice Identifier surfaced for off-chain ABI / deployment-drift checks.
+    string public constant VERSION = "ReputationRegistry/v5";
+
+    // ── Hardening caps (audit H-REP-1/2 + M-REP-A/B) ───────
     /// @notice Max distinct clients that may post feedback on a single agent.
     ///         Bounds the iteration cost of `getSummary` / `readAllFeedback`
-    ///         / `getClients` and prevents permanent view-function DoS via
-    ///         Sybil flooding.
+    ///         / `getClients`. Set to 1000 — large enough that legitimate
+    ///         marketplaces don't hit it in normal operation, small enough
+    ///         that view aggregates stay callable from RPCs at full bucket.
+    ///         (Audit v3 H-4: the prior 10000 value enabled cheap Sybil
+    ///         stuffing under Sapphire's sub-cent gas economics.)
     uint64 public constant MAX_CLIENTS_PER_AGENT = 1000;
-    /// @notice Max feedback rows per (agent, client) pair.
+    /// @notice Max ACTIVE (non-revoked) feedback rows per (agent, client).
+    ///         A revoke frees a slot, so honest reviewers who want to update
+    ///         their position over time are not permanently locked out.
     uint64 public constant MAX_FEEDBACK_PER_PAIR = 50;
+    /// @notice Hard storage cap on total lifetime rows per (agent, client),
+    ///         including revoked. Prevents an attacker from churning
+    ///         post→revoke→post infinitely to bloat the row history that
+    ///         `readAllFeedback` iterates with `includeRevoked = true`.
+    uint64 public constant MAX_FEEDBACK_HISTORY_PER_PAIR = 200;
     /// @notice Max responses per feedback row (any responder).
     uint64 public constant MAX_RESPONSES_PER_FEEDBACK = 50;
 
@@ -75,6 +89,11 @@ contract ReputationRegistry {
     // agentId => clients[] (unique addresses that have left at least one feedback)
     mapping(uint256 => address[]) private _clients;
     mapping(uint256 => mapping(address => bool)) private _clientSeen;
+
+    // (agentId, client) => number of currently-active (non-revoked) feedback rows.
+    // Maintained on every `giveFeedback` (+1) and `revokeFeedback` (-1) so the
+    // active cap can be enforced without scanning the full row history.
+    mapping(uint256 => mapping(address => uint64)) private _activeFeedbackCount;
 
     // ── Events (match ERC-8004 spec verbatim) ───────────────
 
@@ -111,6 +130,12 @@ contract ReputationRegistry {
 
     constructor(address identityRegistry_) {
         require(identityRegistry_ != address(0), "Invalid identity registry");
+        // Sanity-probe (audit v4 COMP-H-2). Refuse to wire to an EOA or to a
+        // contract that doesn't expose ERC-1155's `balanceOf`. The probe
+        // itself is the cheap balanceOf call below — reverts if the callee
+        // isn't a contract or lacks the function selector.
+        require(identityRegistry_.code.length > 0, "Identity registry not a contract");
+        IERC1155(identityRegistry_).balanceOf(address(0), 0);
         _identityRegistry = IERC1155(identityRegistry_);
     }
 
@@ -142,14 +167,27 @@ contract ReputationRegistry {
             _identityRegistry.balanceOf(msg.sender, agentId) == 0,
             "Submitter is the agent owner"
         );
-        // Spec MUST: valueDecimals in [0, 18].
-        require(valueDecimals <= 18, "valueDecimals must be 0-18");
+        // Spec MUST: valueDecimals in [0, 18]. Tightened to [0, 8] to bound
+        // the rescale factor in `getSummary` (10^(maxΔ) ≤ 10^8) and prevent
+        // decimal-bomb griefing where a single high-decimals outlier forces
+        // every other row through a 10^18 rescale, risking unchecked
+        // narrowing on the final `int256 → int128`. (Audit v3 M-6 — documented
+        // deviation from the literal spec range; ratings/reputation values
+        // never need more than 8 decimal places of precision.)
+        require(valueDecimals <= 8, "valueDecimals must be 0-8");
 
-        // Hardening (audit H-REP-1/2): cap per-(agent,client) feedback rows
-        // to bound the inner loop of getSummary / readAllFeedback.
+        // Hardening: two-tier feedback cap (audit M-REP-B).
+        //   • Active cap: max simultaneous non-revoked rows. Revoking frees
+        //     a slot — honest reviewers can update their position over time.
+        //   • History cap: hard ceiling on total lifetime rows including
+        //     revoked. Stops post→revoke→post churn from bloating storage.
         require(
-            _feedbacks[agentId][msg.sender].length < MAX_FEEDBACK_PER_PAIR,
-            "Feedback cap reached for this agent"
+            _activeFeedbackCount[agentId][msg.sender] < MAX_FEEDBACK_PER_PAIR,
+            "Active feedback cap reached"
+        );
+        require(
+            _feedbacks[agentId][msg.sender].length < MAX_FEEDBACK_HISTORY_PER_PAIR,
+            "Feedback history cap reached"
         );
         // Cap distinct clients per agent to bound the outer loop. Once an
         // address has posted at least once it remains eligible to extend
@@ -179,6 +217,9 @@ contract ReputationRegistry {
             _clients[agentId].push(msg.sender);
         }
 
+        // Increment the active count after the row is stored, before emit.
+        ++_activeFeedbackCount[agentId][msg.sender];
+
         emit NewFeedback(
             agentId,
             msg.sender,
@@ -195,12 +236,15 @@ contract ReputationRegistry {
     }
 
     /// @notice Revoke your own feedback by index. The row stays on chain
-    ///         marked isRevoked; readers filter by includeRevoked.
+    ///         marked isRevoked; readers filter by includeRevoked. The
+    ///         caller's active-feedback count is decremented so the
+    ///         freed slot can be used for a future `giveFeedback` call.
     function revokeFeedback(uint256 agentId, uint64 feedbackIndex) external {
         require(feedbackIndex < _feedbacks[agentId][msg.sender].length, "No such feedback");
         Feedback storage fb = _feedbacks[agentId][msg.sender][feedbackIndex];
         require(!fb.isRevoked, "Already revoked");
         fb.isRevoked = true;
+        --_activeFeedbackCount[agentId][msg.sender];
         emit FeedbackRevoked(agentId, msg.sender, feedbackIndex);
     }
 
@@ -218,11 +262,18 @@ contract ReputationRegistry {
             "No such feedback"
         );
 
-        // Hardening (audit H-REP-2): cap responses per feedback row.
-        require(
-            _responses[agentId][clientAddress][feedbackIndex].length < MAX_RESPONSES_PER_FEEDBACK,
-            "Response cap reached"
-        );
+        // Hardening: cap responses per feedback row to bound storage growth
+        // (audit H-REP-2). Agent owners (current NFT holders) bypass the cap
+        // so adversaries can't silence the rebuttal right by stuffing the
+        // 50-slot quota with shill responses from burner wallets (audit v3
+        // M-5). The cap still applies to non-owner responders, preserving
+        // protection against general response-flood DoS.
+        if (_identityRegistry.balanceOf(msg.sender, agentId) == 0) {
+            require(
+                _responses[agentId][clientAddress][feedbackIndex].length < MAX_RESPONSES_PER_FEEDBACK,
+                "Response cap reached"
+            );
+        }
 
         _responses[agentId][clientAddress][feedbackIndex].push(
             ResponseRecord({responder: msg.sender, timestamp: uint64(block.timestamp)})
@@ -298,6 +349,11 @@ contract ReputationRegistry {
         tag2s = new string[](matchCount);
         revokedStatuses = new bool[](matchCount);
 
+        bool tag1Empty = bytes(tag1).length == 0;
+        bool tag2Empty = bytes(tag2).length == 0;
+        bytes32 tag1Hash = tag1Empty ? bytes32(0) : keccak256(bytes(tag1));
+        bytes32 tag2Hash = tag2Empty ? bytes32(0) : keccak256(bytes(tag2));
+
         uint256 k;
         for (uint256 i; i < scan.length; ++i) {
             address c = scan[i];
@@ -305,8 +361,8 @@ contract ReputationRegistry {
             for (uint64 j; j < list.length; ++j) {
                 Feedback storage fb = list[j];
                 if (!includeRevoked && fb.isRevoked) continue;
-                if (!_tagMatches(fb.tag1, tag1)) continue;
-                if (!_tagMatches(fb.tag2, tag2)) continue;
+                if (!_tagMatchesHashed(fb.tag1, tag1Hash, tag1Empty)) continue;
+                if (!_tagMatchesHashed(fb.tag2, tag2Hash, tag2Empty)) continue;
                 clients[k] = c;
                 feedbackIndexes[k] = j;
                 values[k] = fb.value;
@@ -340,6 +396,11 @@ contract ReputationRegistry {
             ? _copyAddresses(clientAddresses)
             : _clients[agentId];
 
+        bool tag1Empty = bytes(tag1).length == 0;
+        bool tag2Empty = bytes(tag2).length == 0;
+        bytes32 tag1Hash = tag1Empty ? bytes32(0) : keccak256(bytes(tag1));
+        bytes32 tag2Hash = tag2Empty ? bytes32(0) : keccak256(bytes(tag2));
+
         // First pass: find max decimals among matches.
         uint8 maxDecimals;
         for (uint256 i; i < scan.length; ++i) {
@@ -347,8 +408,8 @@ contract ReputationRegistry {
             for (uint64 j; j < list.length; ++j) {
                 Feedback storage fb = list[j];
                 if (fb.isRevoked) continue;
-                if (!_tagMatches(fb.tag1, tag1)) continue;
-                if (!_tagMatches(fb.tag2, tag2)) continue;
+                if (!_tagMatchesHashed(fb.tag1, tag1Hash, tag1Empty)) continue;
+                if (!_tagMatchesHashed(fb.tag2, tag2Hash, tag2Empty)) continue;
                 if (fb.valueDecimals > maxDecimals) maxDecimals = fb.valueDecimals;
             }
         }
@@ -361,8 +422,8 @@ contract ReputationRegistry {
             for (uint64 j; j < list.length; ++j) {
                 Feedback storage fb = list[j];
                 if (fb.isRevoked) continue;
-                if (!_tagMatches(fb.tag1, tag1)) continue;
-                if (!_tagMatches(fb.tag2, tag2)) continue;
+                if (!_tagMatchesHashed(fb.tag1, tag1Hash, tag1Empty)) continue;
+                if (!_tagMatchesHashed(fb.tag2, tag2Hash, tag2Empty)) continue;
                 int256 scale = int256(10 ** uint256(maxDecimals - fb.valueDecimals));
                 scaledSum += int256(fb.value) * scale;
                 ++cnt;
@@ -371,7 +432,12 @@ contract ReputationRegistry {
 
         if (cnt == 0) return (0, 0, 0);
         int256 avg = scaledSum / int256(uint256(cnt));
-        summaryValue = int128(avg);
+        // SafeCast reverts on out-of-range narrowing rather than silently
+        // wrapping (audit v3 H-2: Solidity 0.8 does NOT check narrowing
+        // conversions, only arithmetic). The valueDecimals ≤ 8 cap above
+        // makes overflow unreachable from normal use, but SafeCast is the
+        // structural defense.
+        summaryValue = SafeCast.toInt128(avg);
         summaryValueDecimals = maxDecimals;
         count = cnt;
     }
@@ -407,23 +473,41 @@ contract ReputationRegistry {
     }
 
     /// @notice Most recent feedbackIndex this client posted on this agent.
-    ///         Returns 0 if the client has never posted (caller must
-    ///         disambiguate using getClients or a separate hasReviewed check).
+    ///         The companion `exists` flag disambiguates "never posted"
+    ///         (returns `(0, false)`) from "posted exactly one row at
+    ///         index 0" (returns `(0, true)`).
     function getLastIndex(uint256 agentId, address clientAddress)
+        external
+        view
+        returns (uint64 lastIndex, bool exists)
+    {
+        uint256 len = _feedbacks[agentId][clientAddress].length;
+        if (len == 0) return (0, false);
+        return (uint64(len - 1), true);
+    }
+
+    /// @notice Active (non-revoked) feedback count for a (agent, client) pair.
+    function getActiveFeedbackCount(uint256 agentId, address clientAddress)
         external
         view
         returns (uint64)
     {
-        uint256 len = _feedbacks[agentId][clientAddress].length;
-        if (len == 0) return 0;
-        return uint64(len - 1);
+        return _activeFeedbackCount[agentId][clientAddress];
     }
 
     // ── internal helpers ──────────────────────────────────
 
-    function _tagMatches(string memory tag, string memory filter) private pure returns (bool) {
-        if (bytes(filter).length == 0) return true;
-        return keccak256(bytes(tag)) == keccak256(bytes(filter));
+    /// @dev Tag match using pre-hashed filters. An empty filter (hashed to
+    ///      the empty-string keccak) is treated as "any tag accepted".
+    ///      Hoisting the keccak out of the inner loop avoids recomputing it
+    ///      thousands of times per call.
+    function _tagMatchesHashed(string memory tag, bytes32 filterHash, bool filterIsEmpty)
+        private
+        pure
+        returns (bool)
+    {
+        if (filterIsEmpty) return true;
+        return keccak256(bytes(tag)) == filterHash;
     }
 
     function _countMatches(
@@ -433,13 +517,17 @@ contract ReputationRegistry {
         string memory tag2,
         bool includeRevoked
     ) private view returns (uint256 matchCount) {
+        bool tag1Empty = bytes(tag1).length == 0;
+        bool tag2Empty = bytes(tag2).length == 0;
+        bytes32 tag1Hash = tag1Empty ? bytes32(0) : keccak256(bytes(tag1));
+        bytes32 tag2Hash = tag2Empty ? bytes32(0) : keccak256(bytes(tag2));
         for (uint256 i; i < scan.length; ++i) {
             Feedback[] storage list = _feedbacks[agentId][scan[i]];
             for (uint64 j; j < list.length; ++j) {
                 Feedback storage fb = list[j];
                 if (!includeRevoked && fb.isRevoked) continue;
-                if (!_tagMatches(fb.tag1, tag1)) continue;
-                if (!_tagMatches(fb.tag2, tag2)) continue;
+                if (!_tagMatchesHashed(fb.tag1, tag1Hash, tag1Empty)) continue;
+                if (!_tagMatchesHashed(fb.tag2, tag2Hash, tag2Empty)) continue;
                 ++matchCount;
             }
         }
