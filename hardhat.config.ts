@@ -33,6 +33,12 @@ const config: HardhatUserConfig = {
       accounts: [DEPLOYER_PRIVATE_KEY],
     },
   },
+  sourcify: {
+    enabled: true,
+  },
+  etherscan: {
+    enabled: false,
+  },
 };
 
 export default config;
