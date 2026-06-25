@@ -1,18 +1,18 @@
 {
   "stack": "market",
-  "network": "sapphireTestnet",
+  "network": "oasisSapphireTestnet",
   "chainId": 23295,
   "deployer": "0x49B330af2e9B16189a55d45bcf808d2D92bce1f6",
-  "helper": "0xefC7d00794DE1882001a386D0FF40DD1D1c7BB87",
+  "helper": "0xb47c0dc4d22867A8E98bC0A666Df6575995a29b3",
   "contracts": {
     "ContextRegistry": {
-      "address": "0x9A374905B2B286344fCac6f754dCF40F3cb427d5",
+      "address": "0x3CCBEC26AF3Dfc46e37db836dDCDcA821EcA69F7",
       "version": "ContextRegistry/v5"
     },
     "PluralityMemoryNFT": {
-      "address": "0xDe5dB30AE86e27F1E7EeC0AD353d910C4Ca93D08",
+      "address": "0x15844A812e1A1ac38dC1E64685AB3a4ED92bD46F",
       "version": "PluralityMemoryNFT/v5",
-      "registry": "0x9A374905B2B286344fCac6f754dCF40F3cb427d5",
+      "registry": "0x3CCBEC26AF3Dfc46e37db836dDCDcA821EcA69F7",
       "admin": "0x49B330af2e9B16189a55d45bcf808d2D92bce1f6",
       "mintFee": "10000000000000000",
       "feeRecipient": "0x49B330af2e9B16189a55d45bcf808d2D92bce1f6",
@@ -20,11 +20,10 @@
       "marketplaceFeeBps": 250
     },
     "ReputationRegistry": {
-      "address": "0x8D0027e715943FB2f215c884369B744861331E3E",
+      "address": "0x452497E456C99A3c953872137c16C214e045A6f4",
       "version": "ReputationRegistry/v5",
-      "nft": "0xDe5dB30AE86e27F1E7EeC0AD353d910C4Ca93D08"
+      "nft": "0x15844A812e1A1ac38dC1E64685AB3a4ED92bD46F"
     }
   },
-  "deployedAt": "2026-06-06T00:00:00.000Z",
-  "notes": "Atomic deploy via DeployHelper. On-chain invariants verified post-deploy: CR.nftRegistry() == NFT, NFT DEFAULT_ADMIN_ROLE granted to deployer."
+  "deployedAt": "2026-06-24T15:51:15.559Z"
 }

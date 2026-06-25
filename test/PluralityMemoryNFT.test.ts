@@ -173,6 +173,54 @@ describe("PluralityMemoryNFT — register-first mint", function () {
     });
   });
 
+  // Audit claim 2: a CONTRACT minter must not be able to append contexts to a
+  // bucket from inside the ERC-1155 onERC1155Received callback fired during
+  // mintBucket (the freeze-bypass window before bucketHashToTokenId is set).
+  // The checks-effects-interactions fix (state written BEFORE _mint) closes it.
+  describe("mintBucket — onERC1155Received freeze-bypass (audit claim 2)", function () {
+    async function deployAttacker() {
+      const Factory = await ethers.getContractFactory("ReentrantMinter");
+      const attacker = await Factory.deploy(
+        await registry.getAddress(),
+        await nft.getAddress(),
+      );
+      await attacker.waitForDeployment();
+      return attacker;
+    }
+
+    it("reverts the mint when a contract minter tries to append a context during the callback", async function () {
+      const attacker = await deployAttacker();
+
+      // The contract becomes the bucket registrant, then arms the re-entrant
+      // append (a second, never-disclosed context) for the mint callback.
+      await attacker.claim(BUCKET_HASH, CTX1, HASH1);
+      await attacker.arm(BUCKET_HASH, CTX2, HASH2);
+
+      // Post-fix: the freeze is already active when the callback runs, so the
+      // sneaked-in registerContextBatch reverts and unwinds the whole mint.
+      // (Pre-fix, this call would SUCCEED and the bucket would gain CTX2.)
+      await expect(
+        attacker.mint(BUCKET_HASH, METADATA_URI, { value: MINT_FEE }),
+      ).to.be.revertedWith("Bucket already minted");
+
+      // Nothing minted, and the extra context never landed.
+      expect(await nft.bucketHashToTokenId(BUCKET_HASH)).to.equal(0n);
+      expect(await registry.getBucketContextCount(BUCKET_HASH)).to.equal(1n);
+    });
+
+    it("still lets an honest contract minter mint (no append in callback)", async function () {
+      const attacker = await deployAttacker();
+      await attacker.claim(BUCKET_HASH, CTX1, HASH1);
+      // not armed → the callback just accepts the token
+
+      await attacker.mint(BUCKET_HASH, METADATA_URI, { value: MINT_FEE });
+
+      expect(await nft.bucketHashToTokenId(BUCKET_HASH)).to.equal(1n);
+      expect(await nft.balanceOf(await attacker.getAddress(), 1)).to.equal(1n);
+      expect(await registry.getBucketContextCount(BUCKET_HASH)).to.equal(1n);
+    });
+  });
+
   describe("Royalties (ERC-2981) — to platform", function () {
     it("returns the platform as royalty receiver", async function () {
       await registerOne(user1, BUCKET_HASH);

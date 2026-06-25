@@ -241,8 +241,15 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
 
         uint256 tokenId = ++_nextTokenId;
 
-        _mint(msg.sender, tokenId, 1, "");
-
+        // Checks-effects-interactions: commit ALL state BEFORE _mint. _mint
+        // invokes onERC1155Received on a contract minter, and that callback
+        // can re-enter ContextRegistry.registerContextBatch. The registry's
+        // post-mint freeze gates on bucketHashToTokenId(bucketHash) != 0, so
+        // if we set it AFTER _mint the freeze is not yet active during the
+        // callback and the minter could append contexts to a bucket that is
+        // mid-mint. Setting it first makes the freeze effective before any
+        // external call. (mintBucket's own nonReentrant does NOT help here —
+        // the callback targets a different contract.)
         tokenCreator[tokenId] = msg.sender;
         _tokenURIs[tokenId] = metadataURI;
         tokenToBucketHash[tokenId] = bucketHash;
@@ -250,6 +257,8 @@ contract PluralityMemoryNFT is ERC1155, ERC2981, AccessControl, Pausable, Reentr
 
         // ERC-2981: royalty on this token goes to PLATFORM (not creator)
         _setTokenRoyalty(tokenId, feeRecipient, royaltyBps);
+
+        _mint(msg.sender, tokenId, 1, "");
 
         // Audit M-NFT-1 + H-NFT-3: forward exact mintFee to treasury, refund
         // any overpayment to minter. Hybrid hot-path push; on push failure

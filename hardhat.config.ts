@@ -18,7 +18,13 @@ const config: HardhatUserConfig = {
       // many parameters (per ERC-8004 NewFeedback event schema) that overflow
       // the legacy stack-based pipeline.
       viaIR: true,
-      evmVersion: "cancun",
+      // Oasis Sapphire's EVM does not implement Cancun opcodes (notably MCOPY,
+      // which Solidity emits at evmVersion>=cancun for dynamic memory copies).
+      // Cancun bytecode makes every `string`/`bytes`-returning view — incl.
+      // ERC-1155 uri() and ReputationRegistry.readAllFeedback — revert on-chain
+      // with "invalid opcode". Target Paris (Oasis-recommended) so no Cancun
+      // opcode is emitted.
+      evmVersion: "paris",
     },
   },
   networks: {

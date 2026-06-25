@@ -7,9 +7,9 @@ On-chain provenance, ownership, and reputation layer for the Plurality memory ma
 
 | Contract | Address | Explorer |
 |---|---|---|
-| ContextRegistry | `0x9A374905B2B286344fCac6f754dCF40F3cb427d5` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x9A374905B2B286344fCac6f754dCF40F3cb427d5) |
-| PluralityMemoryNFT | `0xDe5dB30AE86e27F1E7EeC0AD353d910C4Ca93D08` | [view](https://explorer.oasis.io/testnet/sapphire/address/0xDe5dB30AE86e27F1E7EeC0AD353d910C4Ca93D08) |
-| ReputationRegistry | `0x8D0027e715943FB2f215c884369B744861331E3E` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x8D0027e715943FB2f215c884369B744861331E3E) |
+| ContextRegistry | `0x3CCBEC26AF3Dfc46e37db836dDCDcA821EcA69F7` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x3CCBEC26AF3Dfc46e37db836dDCDcA821EcA69F7) |
+| PluralityMemoryNFT | `0x15844A812e1A1ac38dC1E64685AB3a4ED92bD46F` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x15844A812e1A1ac38dC1E64685AB3a4ED92bD46F) |
+| ReputationRegistry | `0x452497E456C99A3c953872137c16C214e045A6f4` | [view](https://explorer.oasis.io/testnet/sapphire/address/0x452497E456C99A3c953872137c16C214e045A6f4) |
 
 Deployer / fee recipient: `0x49B330af2e9B16189a55d45bcf808d2D92bce1f6`
 Atomic deploy via DeployHelper: `0xefC7d00794DE1882001a386D0FF40DD1D1c7BB87`
@@ -166,9 +166,9 @@ hardhat.config.ts             # Networks: oasisSapphireTestnet, sepolia
 
 ## Toolchain
 
-- Solidity `0.8.27`, EVM target `cancun`, optimizer `runs=200`, `viaIR=true` (needed for `ReputationRegistry.giveFeedback`'s spec-mandated 8-parameter event)
+- Solidity `0.8.27`, EVM target `paris`, optimizer `runs=200`, `viaIR=true` (needed for `ReputationRegistry.giveFeedback`'s spec-mandated 8-parameter event). Paris (not cancun) because Oasis Sapphire's EVM does not implement Cancun opcodes (notably MCOPY); cancun bytecode makes every `string`/`bytes`-returning view revert on-chain.
 - Hardhat `^2.22.0` with `@nomicfoundation/hardhat-toolbox`
-- OpenZeppelin Contracts `^5.1.0`
+- OpenZeppelin Contracts `5.0.2` (pinned: OZ ≥5.1 hardcodes the `mcopy` opcode in `Arrays.sol`, which won't compile under the Paris target)
 
 ## License
 
